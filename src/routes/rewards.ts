@@ -66,17 +66,17 @@ router.get("/status", authenticate, async (req: Request, res: Response) => {
             bonus_credits: Math.min(scanBonus, SCAN_REWARD_MAX),
             effective_limit: effectiveScanLimit,
             can_earn_more: tier === "free" && scanBonus < SCAN_REWARD_MAX,
-            resets_at: today + "T23:59:59Z",
+            resets_at: today + "T23:59:59+07:00",
         },
         chat: {
             used: chatUsed,
             limit: chatLimit,
-            resets_at: today + "T23:59:59Z",
+            resets_at: today + "T23:59:59+07:00",
         },
         meal_plan_generate: {
             used: mealPlanUsed,
             limit: mealPlanLimit,
-            resets_at: today + "T23:59:59Z",
+            resets_at: today + "T23:59:59+07:00",
         },
         meal_plan: {
             videos_watched: Math.min(mealPlanVideos, MEAL_PLAN_VIDEOS_REQUIRED),

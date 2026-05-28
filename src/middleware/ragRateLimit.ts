@@ -18,6 +18,7 @@ export const SCAN_REWARD_MAX = 3;
 export const MEAL_PLAN_VIDEOS_REQUIRED = 5;
 
 const COL = "rate_limit_counters";
+const VN_OFFSET_MS = 7 * 60 * 60 * 1000;
 
 let _indexReady = false;
 async function ensureIndexes(): Promise<void> {
@@ -35,24 +36,33 @@ async function ensureIndexes(): Promise<void> {
 }
 
 export function todayKey(): string {
-    return new Date().toISOString().slice(0, 10);
+    return new Date(Date.now() + VN_OFFSET_MS).toISOString().slice(0, 10);
 }
 
 export function monthKey(): string {
-    return new Date().toISOString().slice(0, 7);
+    return new Date(Date.now() + VN_OFFSET_MS).toISOString().slice(0, 7);
 }
 
 function secondsUntilMidnightUTC(): number {
-    const now = new Date();
-    const midnight = new Date(now);
-    midnight.setUTCHours(24, 0, 0, 0);
-    return Math.ceil((midnight.getTime() - now.getTime()) / 1000);
+    const shiftedNow = new Date(Date.now() + VN_OFFSET_MS);
+    const nextMidnightInShiftedUtc = Date.UTC(
+        shiftedNow.getUTCFullYear(),
+        shiftedNow.getUTCMonth(),
+        shiftedNow.getUTCDate() + 1,
+    );
+    const nextMidnightVietnam = nextMidnightInShiftedUtc - VN_OFFSET_MS;
+    return Math.ceil((nextMidnightVietnam - Date.now()) / 1000);
 }
 
 export function secondsUntilEndOfMonthUTC(): number {
-    const now = new Date();
-    const endOfMonth = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 1));
-    return Math.ceil((endOfMonth.getTime() - now.getTime()) / 1000);
+    const shiftedNow = new Date(Date.now() + VN_OFFSET_MS);
+    const nextMonthInShiftedUtc = Date.UTC(
+        shiftedNow.getUTCFullYear(),
+        shiftedNow.getUTCMonth() + 1,
+        1,
+    );
+    const nextMonthVietnam = nextMonthInShiftedUtc - VN_OFFSET_MS;
+    return Math.ceil((nextMonthVietnam - Date.now()) / 1000);
 }
 
 async function atomicIncrement(key: string, ttlSeconds?: number): Promise<number> {
@@ -81,6 +91,16 @@ async function atomicIncrement(key: string, ttlSeconds?: number): Promise<number
             return 1;
         }
     }
+}
+
+async function atomicDecrement(key: string): Promise<void> {
+    const db = mongoose.connection.db;
+    if (!db) return;
+    await ensureIndexes();
+    await db.collection(COL).updateOne(
+        { key, count: { $gt: 0 } },
+        { $inc: { count: -1 } },
+    );
 }
 
 // Read a counter without modifying it
@@ -158,15 +178,16 @@ export function ragRateLimit(endpoint: Endpoint) {
         const current = await atomicIncrement(key);
 
         if (current > effectiveLimit) {
+            await atomicDecrement(key);
             const isScan = endpoint === "scan" && tier === "free";
             res.status(429).json({
                 error: "rate_limit_exceeded",
                 message: isScan
                     ? `Bạn đã dùng hết ${effectiveLimit} lượt scan hôm nay. Xem video thưởng để được thêm lượt.`
                     : `Bạn đã dùng hết ${limit} lượt ${endpoint} hôm nay.`,
-                used: current,
+                used: effectiveLimit,
                 limit: effectiveLimit,
-                resets_at: todayKey() + "T23:59:59Z",
+                resets_at: todayKey() + "T23:59:59+07:00",
                 can_watch_ad: isScan && effectiveLimit < (limit + SCAN_REWARD_MAX),
             });
             return;
@@ -174,6 +195,11 @@ export function ragRateLimit(endpoint: Endpoint) {
 
         res.setHeader("X-RateLimit-Limit", effectiveLimit);
         res.setHeader("X-RateLimit-Remaining", effectiveLimit - current);
+        res.on("finish", () => {
+            if (res.statusCode >= 400) {
+                atomicDecrement(key).catch(() => {});
+            }
+        });
         next();
     };
 }

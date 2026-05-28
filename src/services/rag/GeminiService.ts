@@ -1,7 +1,7 @@
 import { GoogleGenerativeAI, GenerativeModel } from "@google/generative-ai";
 import { LLMMessage, LLMOptions, LLMResponse } from "./GroqService";
 
-const GEMINI_MODEL = "gemini-flash-latest";
+const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-flash-latest";
 
 export interface VisionResult {
   main_dish_vi: string;

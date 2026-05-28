@@ -14,7 +14,7 @@ import {
 
 const router = Router();
 
-const GEMINI_MODEL = "gemini-flash-latest";
+const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-flash-latest";
 const GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta/models";
 
 function guessMealType(): string {
@@ -42,18 +42,22 @@ async function callGemini(apiKey: string, body: object): Promise<string> {
   const timer = setTimeout(() => controller.abort(), 45_000);
   try {
     const res = await fetch(
-      `${GEMINI_BASE}/${GEMINI_MODEL}:generateContent?key=${apiKey}`,
+      `${GEMINI_BASE}/${GEMINI_MODEL}:generateContent`,
       {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json", "X-goog-api-key": apiKey },
         body: JSON.stringify(body),
         signal: controller.signal,
       },
     );
     if (!res.ok) {
+      const errorBody = await res.text().catch(() => "");
       if (res.status === 429)
-        throw Object.assign(new Error("AI rate limit"), { status: 429 });
-      throw new Error(`Gemini error: ${res.status}`);
+        throw Object.assign(
+          new Error(`Gemini rate limit${errorBody ? ` - ${errorBody.slice(0, 300)}` : ""}`),
+          { status: 429 },
+        );
+      throw new Error(`Gemini error: ${res.status}${errorBody ? ` - ${errorBody.slice(0, 300)}` : ""}`);
     }
     const data = (await res.json()) as {
       candidates?: { content?: { parts?: { text?: string }[] } }[];
@@ -106,7 +110,8 @@ router.post(
         });
       } catch (err: any) {
         if (err.status === 429) {
-          res.status(429).json({ error: "AI rate limit. Try again later." });
+          console.error("[analyzeFood] Gemini 429:", err.message);
+          res.status(429).json({ error: err.message || "Gemini rate limit. Try again later." });
           return;
         }
         throw err;
@@ -465,6 +470,7 @@ router.post(
 
       res.json({ dishes: results, totals, vitamins, meal_type: guessMealType() });
     } catch (error) {
+      console.error("[analyzeFood] failed:", error);
       res.status(500).json({ error: (error as Error).message });
     }
   },

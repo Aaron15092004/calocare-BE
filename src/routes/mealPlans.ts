@@ -7,7 +7,7 @@ import UserMealPlan from "../models/UserMealPlan";
 import Recipe from "../models/Recipe";
 import User, { IUser } from "../models/User";
 
-const GEMINI_MODEL = "gemini-flash-latest";
+const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-flash-latest";
 const GEMINI_BASE  = "https://generativelanguage.googleapis.com/v1beta/models";
 
 function cleanJson(raw: string): string {
@@ -23,10 +23,10 @@ async function callGemini(apiKey: string, body: object): Promise<string> {
     const timer = setTimeout(() => controller.abort(), 90_000);
     try {
         const res = await fetch(
-            `${GEMINI_BASE}/${GEMINI_MODEL}:generateContent?key=${apiKey}`,
+            `${GEMINI_BASE}/${GEMINI_MODEL}:generateContent`,
             {
                 method: "POST",
-                headers: { "Content-Type": "application/json" },
+                headers: { "Content-Type": "application/json", "X-goog-api-key": apiKey },
                 body: JSON.stringify(body),
                 signal: controller.signal,
             },
