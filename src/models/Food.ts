@@ -22,6 +22,13 @@ export interface IFood extends Document {
     source_reference?: string;
     sequence_number?: number;
     image_url?: string;
+    image_attribution?: {
+        source: string;
+        photographer_name: string;
+        photographer_url: string;
+        photo_url: string;
+        download_location: string;
+    };
     is_deleted: boolean;
     created_at: Date;
     updated_at: Date;
@@ -50,6 +57,13 @@ const FoodSchema = new Schema<IFood>(
         source_reference: { type: String },
         sequence_number: { type: Number },
         image_url: { type: String },
+        image_attribution: {
+            source: { type: String },
+            photographer_name: { type: String },
+            photographer_url: { type: String },
+            photo_url: { type: String },
+            download_location: { type: String },
+        },
         is_deleted: { type: Boolean, default: false, index: true },
     },
     {

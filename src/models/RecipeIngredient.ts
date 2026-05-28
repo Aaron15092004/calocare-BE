@@ -2,7 +2,8 @@ import mongoose, { Schema, Document, Types } from "mongoose";
 
 export interface IRecipeIngredient extends Document {
     recipe_id: Types.ObjectId;
-    food_id: Types.ObjectId;
+    food_id?: Types.ObjectId;
+    ingredient_recipe_id?: Types.ObjectId;
     amount: number;
     unit?: string;
     sort_order: number;
@@ -13,7 +14,8 @@ export interface IRecipeIngredient extends Document {
 const RecipeIngredientSchema = new Schema<IRecipeIngredient>(
     {
         recipe_id: { type: Schema.Types.ObjectId, ref: "Recipe", required: true, index: true },
-        food_id: { type: Schema.Types.ObjectId, ref: "Food", required: true },
+        food_id: { type: Schema.Types.ObjectId, ref: "Food" },
+        ingredient_recipe_id: { type: Schema.Types.ObjectId, ref: "Recipe" },
         amount: { type: Number, required: true },
         unit: { type: String },
         sort_order: { type: Number, default: 0 },

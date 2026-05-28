@@ -8,6 +8,7 @@ import MealPlan from "../../models/MealPlan";
 import PaymentTransaction from "../../models/PaymentTransaction";
 import FoodDiary from "../../models/FoodDiary";
 import FoodGroup from "../../models/FoodGroup";
+import Store from "../../models/Store";
 
 const router = Router();
 
@@ -32,6 +33,10 @@ router.get("/", authenticate, requireAdminOrModerator, async (_req: Request, res
             diaryLast7Days,
             foodsByGroup,
             pendingRecipes,
+            subscriptionTierAgg,
+            totalStores,
+            pendingStores,
+            storeStatusAgg,
         ] = await Promise.all([
             User.countDocuments(),
             Recipe.countDocuments({ is_deleted: { $ne: true } }),
@@ -104,6 +109,27 @@ router.get("/", authenticate, requireAdminOrModerator, async (_req: Request, res
 
             // Pending recipes
             Recipe.countDocuments({ is_public: true, is_approved: false, is_deleted: { $ne: true } }),
+
+            // User subscription tier breakdown
+            User.aggregate([
+                { $group: { _id: "$subscription_tier", count: { $sum: 1 } } },
+            ]),
+
+            // Total stores
+            Store.countDocuments(),
+
+            // Pending (not yet approved) stores
+            Store.countDocuments({ is_active: false }),
+
+            // Store status breakdown: active vs pending
+            Store.aggregate([
+                {
+                    $group: {
+                        _id: "$is_active",
+                        count: { $sum: 1 },
+                    },
+                },
+            ]),
         ]);
 
         // Build a complete 12-month series with zeros for missing months
@@ -155,6 +181,21 @@ router.get("/", authenticate, requireAdminOrModerator, async (_req: Request, res
             value: r.count,
         }));
 
+        // Subscription tier distribution
+        const tierOrder = ["free", "premium", "pro"];
+        const tierMap = new Map(subscriptionTierAgg.map((r: any) => [r._id || "free", r.count]));
+        const subscriptionTierChart = tierOrder.map((tier) => ({
+            name: tier.charAt(0).toUpperCase() + tier.slice(1),
+            value: tierMap.get(tier) || 0,
+        }));
+
+        // Store status breakdown
+        const storeStatusMap = new Map(storeStatusAgg.map((r: any) => [r._id, r.count]));
+        const storeStatusChart = [
+            { name: "Active", value: storeStatusMap.get(true) || 0 },
+            { name: "Pending", value: storeStatusMap.get(false) || 0 },
+        ];
+
         res.json({
             stats: {
                 total_users: totalUsers,
@@ -165,12 +206,16 @@ router.get("/", authenticate, requireAdminOrModerator, async (_req: Request, res
                 new_users_this_month: newUsersThisMonth,
                 diary_entries_last_7days: recentDiaryEntries,
                 pending_recipes: pendingRecipes,
+                total_stores: totalStores,
+                pending_stores: pendingStores,
             },
             charts: {
                 user_growth: userGrowthChart,
                 revenue: revenueChart,
                 diary_activity: diaryChart,
                 food_group_distribution: foodGroupChart,
+                subscription_tier_distribution: subscriptionTierChart,
+                store_status: storeStatusChart,
             },
             recent_transactions: recentTransactions,
         });

@@ -35,6 +35,7 @@ router.get("/", async (req: Request, res: Response) => {
 
         const recipes = await Recipe.find(filter)
             .populate("category_id", "name_vi name_en")
+            .populate("creator_id", "display_name avatar_url email")
             .sort({ created_at: -1 })
             .limit(Number(limit))
             .skip(Number(offset));
@@ -75,20 +76,18 @@ router.get("/mine", authenticate, async (req: Request, res: Response) => {
 // GET /api/recipes/:id — includes ingredients
 router.get("/:id", async (req: Request, res: Response) => {
     try {
-        const recipe = await Recipe.findById(req.params.id).populate(
-            "category_id",
-            "name_vi name_en",
-        );
+        const recipe = await Recipe.findById(req.params.id)
+            .populate("category_id", "name_vi name_en")
+            .populate("creator_id", "display_name avatar_url email");
         if (!recipe) {
             res.status(404).json({ error: "Recipe not found" });
             return;
         }
         await Recipe.updateOne({ _id: recipe._id }, { $inc: { view_count: 1 } });
 
-        const ingredients = await RecipeIngredient.find({ recipe_id: recipe._id }).populate(
-            "food_id",
-            "name_vi name_en energy_kcal protein lipid glucid fiber",
-        );
+        const ingredients = await RecipeIngredient.find({ recipe_id: recipe._id })
+            .populate("food_id", "name_vi name_en energy_kcal protein lipid glucid fiber")
+            .populate("ingredient_recipe_id", "name_vi name_en calories protein fat carbs fiber total_weight");
         res.json({ ...recipe.toObject(), ingredients });
     } catch (error) {
         res.status(500).json({ error: (error as Error).message });
@@ -124,7 +123,11 @@ router.post("/", authenticate, async (req: Request, res: Response) => {
         }
 
         res.status(201).json(recipe);
-    } catch (error) {
+    } catch (error: any) {
+        if (error.code === 11000 && error.keyPattern?.code) {
+            res.status(409).json({ error: "Mã code đã tồn tại, vui lòng dùng mã khác." });
+            return;
+        }
         res.status(500).json({ error: (error as Error).message });
     }
 });
@@ -172,7 +175,11 @@ router.put("/:id", authenticate, async (req: Request, res: Response) => {
         }
 
         res.json(updated);
-    } catch (error) {
+    } catch (error: any) {
+        if (error.code === 11000 && error.keyPattern?.code) {
+            res.status(409).json({ error: "Mã code đã tồn tại, vui lòng dùng mã khác." });
+            return;
+        }
         res.status(500).json({ error: (error as Error).message });
     }
 });

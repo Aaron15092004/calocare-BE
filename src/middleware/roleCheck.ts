@@ -14,3 +14,4 @@ export const requireRole = (...roles: string[]) => {
 
 export const requireAdmin = requireRole("admin");
 export const requireAdminOrModerator = requireRole("admin", "moderator");
+export const requireStoreOwner = requireRole("admin", "moderator", "store_owner");

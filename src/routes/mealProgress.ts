@@ -9,10 +9,11 @@ const router = Router();
 router.get("/", authenticate, async (req: Request, res: Response) => {
     try {
         const user = req.user as IUser;
-        const { day_number, meal_type } = req.query;
+        const { day_number, meal_type, user_meal_plan_id } = req.query;
         const filter: Record<string, unknown> = { user_id: user._id };
         if (day_number) filter.day_number = Number(day_number);
         if (meal_type) filter.meal_type = meal_type;
+        if (user_meal_plan_id) filter.user_meal_plan_id = user_meal_plan_id;
 
         const progress = await MealProgress.find(filter).sort({ completed_at: -1 });
         res.json(progress);

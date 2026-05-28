@@ -12,6 +12,7 @@ export interface IMenuItem {
     glucid?: number;
     fiber?: number;
     nutrients_extended?: Record<string, unknown>;
+    nutrition_verified?: boolean;
     is_available: boolean;
 }
 
@@ -24,6 +25,8 @@ export interface IStore extends Document {
     phone?: string;
     website?: string;
     location?: { lat: number; lng: number };
+    google_place_id?: string;
+    google_maps_url?: string;
     category?: string; // "restaurant" | "cafe" | "bakery" | "fastfood" | "other"
     images: string[];
     menu_items: IMenuItem[];
@@ -31,7 +34,10 @@ export interface IStore extends Document {
     subscription_expires_at?: Date;
     is_verified: boolean;
     is_active: boolean;
+    reject_reason?: string;
     views_count: number;
+    average_rating: number;
+    rating_count: number;
     created_at: Date;
     updated_at: Date;
 }
@@ -48,6 +54,7 @@ const MenuItemSchema = new Schema<IMenuItem>({
     glucid: { type: Number },
     fiber: { type: Number },
     nutrients_extended: { type: Schema.Types.Mixed },
+    nutrition_verified: { type: Boolean, default: false },
     is_available: { type: Boolean, default: true },
 }, { _id: true });
 
@@ -64,6 +71,8 @@ const StoreSchema = new Schema<IStore>(
             lat: { type: Number },
             lng: { type: Number },
         },
+        google_place_id: { type: String },
+        google_maps_url: { type: String },
         category: {
             type: String,
             enum: ["restaurant", "cafe", "bakery", "fastfood", "other"],
@@ -74,8 +83,11 @@ const StoreSchema = new Schema<IStore>(
         subscription_tier: { type: String, enum: ["basic", "pro"], default: "basic" },
         subscription_expires_at: { type: Date },
         is_verified: { type: Boolean, default: false },
-        is_active: { type: Boolean, default: true },
+        is_active: { type: Boolean, default: false },
+        reject_reason: { type: String },
         views_count: { type: Number, default: 0 },
+        average_rating: { type: Number, default: 0 },
+        rating_count: { type: Number, default: 0 },
     },
     {
         timestamps: { createdAt: "created_at", updatedAt: "updated_at" },

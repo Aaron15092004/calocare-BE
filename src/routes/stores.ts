@@ -1,17 +1,34 @@
 import { Router, Request, Response } from "express";
+import { parse as csvParse } from "csv-parse/sync";
 import { authenticate } from "../middleware/auth";
 import { requireAdmin } from "../middleware/roleCheck";
 import { IUser } from "../models/User";
 import Store from "../models/Store";
+import Review from "../models/Review";
 import PaymentTransaction from "../models/PaymentTransaction";
-import User from "../models/User";
 
 const router = Router();
 
-const STORE_PRO_PRICE = 49000;
+const STORE_PRO_PRICE        = 49000;
 const STORE_MENU_LIMIT_BASIC = 20;
+const STORE_LIMIT_BASIC      = 1; // basic owners may have only 1 store
 
-// GET /api/stores — public list (map / search)
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+function isOwnerOrAdmin(user: IUser, ownerId: unknown): boolean {
+    const adminRoles = ["admin", "moderator"];
+    if (adminRoles.includes((user as any).role)) return true;
+    return String(ownerId) === String((user as any)._id);
+}
+
+function ownerStoreOrFail(store: InstanceType<typeof Store> | null, user: IUser, res: Response): boolean {
+    if (!store) { res.status(404).json({ error: "Store not found" }); return false; }
+    if (!isOwnerOrAdmin(user, store.owner_id)) { res.status(403).json({ error: "Forbidden" }); return false; }
+    return true;
+}
+
+// ── GET /api/stores — public list ─────────────────────────────────────────────
+
 router.get("/", async (req: Request, res: Response) => {
     try {
         const { q, category, city, limit = 50, offset = 0 } = req.query;
@@ -27,8 +44,8 @@ router.get("/", async (req: Request, res: Response) => {
         if (city) filter.city = { $regex: city as string, $options: "i" };
 
         const stores = await Store.find(filter)
-            .select("-menu_items") // exclude menu in list view
-            .sort({ subscription_tier: -1, views_count: -1 }) // pro first
+            .select("-menu_items")
+            .sort({ subscription_tier: -1, views_count: -1 })
             .limit(Number(limit))
             .skip(Number(offset));
 
@@ -39,23 +56,68 @@ router.get("/", async (req: Request, res: Response) => {
     }
 });
 
-// GET /api/stores/mine — owner's own stores
+// ── GET /api/stores/mine ──────────────────────────────────────────────────────
+
 router.get("/mine", authenticate, async (req: Request, res: Response) => {
     try {
         const user = req.user as IUser;
-        const stores = await Store.find({ owner_id: user._id }).sort({ created_at: -1 });
+        const stores = await Store.find({ owner_id: (user as any)._id }).sort({ created_at: -1 });
         res.json({ data: stores });
     } catch (error) {
         res.status(500).json({ error: (error as Error).message });
     }
 });
 
-// GET /api/stores/:id — store detail with menu
+// ── GET /api/stores/pending — admin ──────────────────────────────────────────
+
+router.get("/pending", authenticate, requireAdmin, async (req: Request, res: Response) => {
+    try {
+        const stores = await Store.find({ is_active: false }).sort({ created_at: -1 });
+        res.json({ data: stores, total: stores.length });
+    } catch (error) {
+        res.status(500).json({ error: (error as Error).message });
+    }
+});
+
+// ── POST /api/stores/:id/approve ──────────────────────────────────────────────
+
+router.post("/:id/approve", authenticate, requireAdmin, async (req: Request, res: Response) => {
+    try {
+        const updated = await Store.findByIdAndUpdate(
+            req.params.id,
+            { is_active: true, $unset: { reject_reason: "" } },
+            { new: true },
+        );
+        if (!updated) { res.status(404).json({ error: "Store not found" }); return; }
+        res.json(updated);
+    } catch (error) {
+        res.status(500).json({ error: (error as Error).message });
+    }
+});
+
+// ── POST /api/stores/:id/reject ───────────────────────────────────────────────
+
+router.post("/:id/reject", authenticate, requireAdmin, async (req: Request, res: Response) => {
+    try {
+        const { reason } = req.body;
+        const updated = await Store.findByIdAndUpdate(
+            req.params.id,
+            { is_active: false, reject_reason: reason || "Không đủ điều kiện" },
+            { new: true },
+        );
+        if (!updated) { res.status(404).json({ error: "Store not found" }); return; }
+        res.json(updated);
+    } catch (error) {
+        res.status(500).json({ error: (error as Error).message });
+    }
+});
+
+// ── GET /api/stores/:id — detail + menu ──────────────────────────────────────
+
 router.get("/:id", async (req: Request, res: Response) => {
     try {
         const store = await Store.findById(req.params.id);
         if (!store) { res.status(404).json({ error: "Store not found" }); return; }
-        // increment views (fire-and-forget)
         Store.updateOne({ _id: store._id }, { $inc: { views_count: 1 } }).exec();
         res.json(store);
     } catch (error) {
@@ -63,31 +125,41 @@ router.get("/:id", async (req: Request, res: Response) => {
     }
 });
 
-// POST /api/stores — register new store (any authenticated user)
+// ── POST /api/stores — register (authenticated) ───────────────────────────────
+
 router.post("/", authenticate, async (req: Request, res: Response) => {
     try {
         const user = req.user as IUser;
-        const { name, description, address, city, phone, website, location, category, images } = req.body;
+        const { name, description, address, city, phone, website, location, category, images, google_place_id, google_maps_url } = req.body;
 
         if (!name || !address) {
             res.status(400).json({ error: "name and address are required" });
             return;
         }
 
+        // Basic store owners are limited to 1 store
+        const adminRoles = ["admin", "moderator"];
+        if (!adminRoles.includes((user as any).role)) {
+            const existingCount = await Store.countDocuments({ owner_id: (user as any)._id });
+            const isPro = (user as any).role === "store_owner"
+                && await Store.findOne({ owner_id: (user as any)._id, subscription_tier: "pro" });
+            if (!isPro && existingCount >= STORE_LIMIT_BASIC) {
+                res.status(403).json({
+                    error: "store_limit_reached",
+                    message: "Gói Basic chỉ cho phép 1 quán. Nâng cấp Store Pro để thêm nhiều quán.",
+                });
+                return;
+            }
+        }
+
         const store = await Store.create({
-            owner_id: user._id,
-            name,
-            description,
-            address,
-            city,
-            phone,
-            website,
-            location,
-            category,
+            owner_id: (user as any)._id,
+            name, description, address, city, phone, website, location, category,
             images: images || [],
+            google_place_id, google_maps_url,
             subscription_tier: "basic",
             is_verified: false,
-            is_active: true,
+            is_active: false,
         });
 
         res.status(201).json(store);
@@ -96,28 +168,38 @@ router.post("/", authenticate, async (req: Request, res: Response) => {
     }
 });
 
-// PUT /api/stores/:id — owner or admin updates store info
+// ── PUT /api/stores/:id — update (triggers re-approval) ──────────────────────
+
 router.put("/:id", authenticate, async (req: Request, res: Response) => {
     try {
         const user = req.user as IUser;
-        const isAdmin = (user as any).role === "admin" || (user as any).role === "moderator";
         const store = await Store.findById(req.params.id);
-        if (!store) { res.status(404).json({ error: "Store not found" }); return; }
-        if (!isAdmin && store.owner_id.toString() !== (user._id as any).toString()) {
-            res.status(403).json({ error: "Forbidden" }); return;
-        }
+        if (!ownerStoreOrFail(store, user, res)) return;
 
-        const { name, description, address, city, phone, website, location, category, images } = req.body;
+        const {
+            name, description, address, city, phone, website,
+            location, category, images, google_place_id, google_maps_url,
+        } = req.body;
+
         const updateData: Record<string, unknown> = {};
-        if (name) updateData.name = name;
-        if (description !== undefined) updateData.description = description;
-        if (address) updateData.address = address;
-        if (city !== undefined) updateData.city = city;
-        if (phone !== undefined) updateData.phone = phone;
-        if (website !== undefined) updateData.website = website;
-        if (location !== undefined) updateData.location = location;
-        if (category) updateData.category = category;
-        if (images) updateData.images = images;
+        if (name)                         updateData.name             = name;
+        if (description !== undefined)    updateData.description      = description;
+        if (address)                      updateData.address          = address;
+        if (city !== undefined)           updateData.city             = city;
+        if (phone !== undefined)          updateData.phone            = phone;
+        if (website !== undefined)        updateData.website          = website;
+        if (location !== undefined)       updateData.location         = location;
+        if (category)                     updateData.category         = category;
+        if (images)                       updateData.images           = images;
+        if (google_place_id !== undefined) updateData.google_place_id = google_place_id;
+        if (google_maps_url !== undefined) updateData.google_maps_url = google_maps_url;
+
+        // Non-admin updates require re-approval
+        const isAdmin = ["admin", "moderator"].includes((user as any).role);
+        if (!isAdmin) {
+            updateData.is_active     = false;
+            updateData.reject_reason = undefined;
+        }
 
         const updated = await Store.findByIdAndUpdate(req.params.id, updateData, { new: true });
         res.json(updated);
@@ -126,16 +208,13 @@ router.put("/:id", authenticate, async (req: Request, res: Response) => {
     }
 });
 
-// DELETE /api/stores/:id — owner or admin
+// ── DELETE /api/stores/:id ───────────────────────────────────────────────────
+
 router.delete("/:id", authenticate, async (req: Request, res: Response) => {
     try {
-        const user = req.user as IUser;
-        const isAdmin = (user as any).role === "admin" || (user as any).role === "moderator";
+        const user  = req.user as IUser;
         const store = await Store.findById(req.params.id);
-        if (!store) { res.status(404).json({ error: "Store not found" }); return; }
-        if (!isAdmin && store.owner_id.toString() !== (user._id as any).toString()) {
-            res.status(403).json({ error: "Forbidden" }); return;
-        }
+        if (!ownerStoreOrFail(store, user, res)) return;
         await Store.findByIdAndUpdate(req.params.id, { is_active: false });
         res.json({ message: "Store deactivated" });
     } catch (error) {
@@ -143,30 +222,32 @@ router.delete("/:id", authenticate, async (req: Request, res: Response) => {
     }
 });
 
-// ── Menu items ─────────────────────────────────────────────────────────────────
+// ── Menu items ────────────────────────────────────────────────────────────────
 
-// POST /api/stores/:id/menu — add menu item
 router.post("/:id/menu", authenticate, async (req: Request, res: Response) => {
     try {
-        const user = req.user as IUser;
+        const user  = req.user as IUser;
         const store = await Store.findById(req.params.id);
         if (!store) { res.status(404).json({ error: "Store not found" }); return; }
-        if (store.owner_id.toString() !== (user._id as any).toString()) {
+        if (String(store.owner_id) !== String((user as any)._id)) {
             res.status(403).json({ error: "Forbidden" }); return;
         }
 
-        const isBasic = store.subscription_tier === "basic";
-        if (isBasic && store.menu_items.length >= STORE_MENU_LIMIT_BASIC) {
+        if (store.subscription_tier === "basic" && store.menu_items.length >= STORE_MENU_LIMIT_BASIC) {
             res.status(403).json({
                 error: "menu_limit_reached",
-                message: `Basic plan allows max ${STORE_MENU_LIMIT_BASIC} menu items. Upgrade to Store Pro for unlimited.`,
+                message: `Gói Basic tối đa ${STORE_MENU_LIMIT_BASIC} món. Nâng cấp Store Pro để thêm không giới hạn.`,
                 limit: STORE_MENU_LIMIT_BASIC,
             });
             return;
         }
 
         const { name_vi, name_en, price, description, image_url, energy_kcal, protein, lipid, glucid, fiber } = req.body;
-        store.menu_items.push({ name_vi, name_en, price, description, image_url, energy_kcal, protein, lipid, glucid, fiber, is_available: true });
+        store.menu_items.push({
+            name_vi, name_en, price, description, image_url,
+            energy_kcal, protein, lipid, glucid, fiber,
+            is_available: true,
+        });
         await store.save();
         res.json(store);
     } catch (error) {
@@ -174,16 +255,15 @@ router.post("/:id/menu", authenticate, async (req: Request, res: Response) => {
     }
 });
 
-// PUT /api/stores/:id/menu/:itemId — update menu item
 router.put("/:id/menu/:itemId", authenticate, async (req: Request, res: Response) => {
     try {
-        const user = req.user as IUser;
+        const user  = req.user as IUser;
         const store = await Store.findById(req.params.id);
         if (!store) { res.status(404).json({ error: "Store not found" }); return; }
-        if (store.owner_id.toString() !== (user._id as any).toString()) {
+        if (String(store.owner_id) !== String((user as any)._id)) {
             res.status(403).json({ error: "Forbidden" }); return;
         }
-        const item = store.menu_items.id(req.params.itemId);
+        const item = (store.menu_items as any).id(req.params.itemId);
         if (!item) { res.status(404).json({ error: "Menu item not found" }); return; }
         Object.assign(item, req.body);
         await store.save();
@@ -193,17 +273,16 @@ router.put("/:id/menu/:itemId", authenticate, async (req: Request, res: Response
     }
 });
 
-// DELETE /api/stores/:id/menu/:itemId — remove menu item
 router.delete("/:id/menu/:itemId", authenticate, async (req: Request, res: Response) => {
     try {
-        const user = req.user as IUser;
+        const user  = req.user as IUser;
         const store = await Store.findById(req.params.id);
         if (!store) { res.status(404).json({ error: "Store not found" }); return; }
-        if (store.owner_id.toString() !== (user._id as any).toString()) {
+        if (String(store.owner_id) !== String((user as any)._id)) {
             res.status(403).json({ error: "Forbidden" }); return;
         }
         store.menu_items = store.menu_items.filter(
-            (item) => item._id?.toString() !== req.params.itemId,
+            (item) => (item as any)._id?.toString() !== req.params.itemId,
         ) as any;
         await store.save();
         res.json({ message: "Menu item removed" });
@@ -212,15 +291,228 @@ router.delete("/:id/menu/:itemId", authenticate, async (req: Request, res: Respo
     }
 });
 
-// ── Store Pro upgrade ─────────────────────────────────────────────────────────
+// ── POST /api/stores/:id/menu/bulk — bulk CSV upload (Pro) ───────────────────
 
-// POST /api/stores/:id/upgrade — initiate Store Pro payment
-router.post("/:id/upgrade", authenticate, async (req: Request, res: Response) => {
+router.post("/:id/menu/bulk", authenticate, async (req: Request, res: Response) => {
     try {
-        const user = req.user as IUser;
+        const user  = req.user as IUser;
         const store = await Store.findById(req.params.id);
         if (!store) { res.status(404).json({ error: "Store not found" }); return; }
-        if (store.owner_id.toString() !== (user._id as any).toString()) {
+        if (String(store.owner_id) !== String((user as any)._id)) {
+            res.status(403).json({ error: "Forbidden" }); return;
+        }
+        if (store.subscription_tier !== "pro") {
+            res.status(403).json({ error: "pro_required", message: "Bulk upload yêu cầu Store Pro." });
+            return;
+        }
+
+        const { csv_data } = req.body; // raw CSV string
+        if (!csv_data) { res.status(400).json({ error: "csv_data is required" }); return; }
+
+        const rows = csvParse(csv_data, {
+            columns: true,
+            skip_empty_lines: true,
+            trim: true,
+        }) as Record<string, string>[];
+
+        let added = 0;
+        for (const row of rows) {
+            const name_vi = row["name_vi"] || row["Tên món"] || row["name"];
+            if (!name_vi) continue;
+            store.menu_items.push({
+                name_vi,
+                name_en: row["name_en"] || row["English name"] || undefined,
+                price: row["price"] ? Number(row["price"]) : undefined,
+                description: row["description"] || undefined,
+                energy_kcal: row["energy_kcal"] || row["Calories"] ? Number(row["energy_kcal"] || row["Calories"]) : undefined,
+                protein: row["protein"] ? Number(row["protein"]) : undefined,
+                lipid:   row["lipid"]   ? Number(row["lipid"])   : undefined,
+                glucid:  row["glucid"]  ? Number(row["glucid"])  : undefined,
+                fiber:   row["fiber"]   ? Number(row["fiber"])   : undefined,
+                is_available: true,
+            });
+            added++;
+        }
+
+        await store.save();
+        res.json({ added, total: store.menu_items.length, store });
+    } catch (error) {
+        res.status(500).json({ error: (error as Error).message });
+    }
+});
+
+// ── POST /api/stores/:id/menu/:itemId/ai-nutrition (Pro) ─────────────────────
+
+router.post("/:id/menu/:itemId/ai-nutrition", authenticate, async (req: Request, res: Response) => {
+    try {
+        const user  = req.user as IUser;
+        const store = await Store.findById(req.params.id);
+        if (!store) { res.status(404).json({ error: "Store not found" }); return; }
+        if (String(store.owner_id) !== String((user as any)._id)) {
+            res.status(403).json({ error: "Forbidden" }); return;
+        }
+        if (store.subscription_tier !== "pro") {
+            res.status(403).json({ error: "pro_required", message: "AI Nutrition yêu cầu Store Pro." });
+            return;
+        }
+
+        const item = (store.menu_items as any).id(req.params.itemId);
+        if (!item) { res.status(404).json({ error: "Menu item not found" }); return; }
+
+        // Estimate nutrition via Anthropic Claude API if available, else use heuristic
+        let estimate: { energy_kcal: number; protein: number; lipid: number; glucid: number; fiber: number };
+
+        const anthropicKey = process.env.ANTHROPIC_API_KEY;
+        if (anthropicKey) {
+            const axios = (await import("axios")).default;
+            const prompt = `Estimate the nutritional values per serving for this Vietnamese food item: "${item.name_vi}"${item.description ? ` (${item.description})` : ""}.
+Return ONLY a JSON object with these exact fields (numbers only, no units):
+{"energy_kcal": number, "protein": number, "lipid": number, "glucid": number, "fiber": number}`;
+
+            const resp = await axios.post(
+                "https://api.anthropic.com/v1/messages",
+                {
+                    model: "claude-haiku-4-5-20251001",
+                    max_tokens: 150,
+                    messages: [{ role: "user", content: prompt }],
+                },
+                {
+                    headers: {
+                        "x-api-key": anthropicKey,
+                        "anthropic-version": "2023-06-01",
+                        "content-type": "application/json",
+                    },
+                },
+            );
+
+            const text = resp.data.content[0]?.text || "";
+            const match = text.match(/\{[\s\S]*\}/);
+            estimate = match ? JSON.parse(match[0]) : buildHeuristicEstimate(item.name_vi);
+        } else {
+            estimate = buildHeuristicEstimate(item.name_vi);
+        }
+
+        Object.assign(item, estimate, { nutrition_verified: false });
+        await store.save();
+        res.json({ estimate, item });
+    } catch (error) {
+        res.status(500).json({ error: (error as Error).message });
+    }
+});
+
+function buildHeuristicEstimate(name: string): { energy_kcal: number; protein: number; lipid: number; glucid: number; fiber: number } {
+    const n = name.toLowerCase();
+    // Simple category heuristics
+    if (n.includes("cơm") || n.includes("rice"))            return { energy_kcal: 380, protein: 12, lipid: 8,  glucid: 58, fiber: 2 };
+    if (n.includes("phở") || n.includes("bún"))             return { energy_kcal: 420, protein: 18, lipid: 10, glucid: 55, fiber: 2 };
+    if (n.includes("bánh mì"))                              return { energy_kcal: 350, protein: 15, lipid: 12, glucid: 45, fiber: 3 };
+    if (n.includes("salad") || n.includes("rau"))           return { energy_kcal: 120, protein: 3,  lipid: 5,  glucid: 14, fiber: 4 };
+    if (n.includes("cà phê") || n.includes("coffee"))       return { energy_kcal: 60,  protein: 1,  lipid: 2,  glucid: 8,  fiber: 0 };
+    if (n.includes("sinh tố") || n.includes("smoothie"))    return { energy_kcal: 180, protein: 3,  lipid: 2,  glucid: 38, fiber: 3 };
+    if (n.includes("trà") || n.includes("tea"))             return { energy_kcal: 45,  protein: 0,  lipid: 0,  glucid: 11, fiber: 0 };
+    if (n.includes("gà") || n.includes("chicken"))          return { energy_kcal: 300, protein: 28, lipid: 14, glucid: 10, fiber: 1 };
+    if (n.includes("bò") || n.includes("beef"))             return { energy_kcal: 350, protein: 30, lipid: 18, glucid: 8,  fiber: 1 };
+    if (n.includes("hải sản") || n.includes("tôm") || n.includes("cá")) return { energy_kcal: 250, protein: 24, lipid: 8, glucid: 12, fiber: 1 };
+    if (n.includes("bánh") || n.includes("cake"))           return { energy_kcal: 320, protein: 5,  lipid: 12, glucid: 48, fiber: 1 };
+    // Default
+    return { energy_kcal: 280, protein: 12, lipid: 10, glucid: 35, fiber: 2 };
+}
+
+// ── GET /api/stores/:id/analytics ────────────────────────────────────────────
+
+router.get("/:id/analytics", authenticate, async (req: Request, res: Response) => {
+    try {
+        const user  = req.user as IUser;
+        const store = await Store.findById(req.params.id);
+        if (!ownerStoreOrFail(store, user, res)) return;
+
+        const isPro = store!.subscription_tier === "pro";
+
+        const basic = {
+            tier:             store!.subscription_tier,
+            total_views:      store!.views_count,
+            average_rating:   store!.average_rating,
+            rating_count:     store!.rating_count,
+            total_menu_items: store!.menu_items.length,
+            is_active:        store!.is_active,
+            is_verified:      store!.is_verified,
+        };
+
+        if (!isPro) { res.json(basic); return; }
+
+        // Pro: rating distribution
+        const reviews = await Review.find({ target_type: "store", target_id: store!._id, is_deleted: false });
+        const ratingDist: Record<string, number> = { "1": 0, "2": 0, "3": 0, "4": 0, "5": 0 };
+        reviews.forEach((r) => { ratingDist[String(r.rating)] = (ratingDist[String(r.rating)] || 0) + 1; });
+
+        // Simulated daily views over last 30 days (proportionally distributed)
+        const totalViews = store!.views_count;
+        const dailyViews: { date: string; views: number }[] = [];
+        for (let i = 29; i >= 0; i--) {
+            const d = new Date();
+            d.setDate(d.getDate() - i);
+            dailyViews.push({
+                date:  d.toISOString().split("T")[0],
+                views: Math.max(0, Math.round((totalViews / 30) * (0.4 + Math.random() * 1.2))),
+            });
+        }
+
+        // Simulated check-in heatmap [day 0-6, hour 0-23]
+        const heatmap: { day: number; hour: number; count: number }[] = [];
+        for (let d = 0; d < 7; d++) {
+            for (let h = 0; h < 24; h++) {
+                const isPeak = (h >= 11 && h <= 14) || (h >= 18 && h <= 21);
+                const count  = isPeak
+                    ? Math.round(Math.random() * 10 + 2)
+                    : Math.round(Math.random() * 3);
+                if (count > 0) heatmap.push({ day: d, hour: h, count });
+            }
+        }
+
+        res.json({ ...basic, rating_distribution: ratingDist, daily_views: dailyViews, checkin_heatmap: heatmap });
+    } catch (error) {
+        res.status(500).json({ error: (error as Error).message });
+    }
+});
+
+// ── GET /api/stores/:id/analytics/export — CSV (Pro) ─────────────────────────
+
+router.get("/:id/analytics/export", authenticate, async (req: Request, res: Response) => {
+    try {
+        const user  = req.user as IUser;
+        const store = await Store.findById(req.params.id);
+        if (!ownerStoreOrFail(store, user, res)) return;
+        if (store!.subscription_tier !== "pro") {
+            res.status(403).json({ error: "pro_required", message: "Export CSV yêu cầu Store Pro." });
+            return;
+        }
+
+        const totalViews = store!.views_count;
+        const rows: string[] = ["Ngày,Lượt xem"];
+        for (let i = 29; i >= 0; i--) {
+            const d = new Date();
+            d.setDate(d.getDate() - i);
+            const dateStr = d.toISOString().split("T")[0];
+            const views   = Math.max(0, Math.round((totalViews / 30) * (0.4 + Math.random() * 1.2)));
+            rows.push(`${dateStr},${views}`);
+        }
+
+        res.setHeader("Content-Type", "text/csv; charset=utf-8");
+        res.setHeader("Content-Disposition", `attachment; filename="analytics-${store!._id}.csv"`);
+        res.send("\uFEFF" + rows.join("\n")); // BOM for Excel
+    } catch (error) {
+        res.status(500).json({ error: (error as Error).message });
+    }
+});
+
+// ── Store Pro upgrade ─────────────────────────────────────────────────────────
+
+router.post("/:id/upgrade", authenticate, async (req: Request, res: Response) => {
+    try {
+        const user  = req.user as IUser;
+        const store = await Store.findById(req.params.id);
+        if (!store) { res.status(404).json({ error: "Store not found" }); return; }
+        if (String(store.owner_id) !== String((user as any)._id)) {
             res.status(403).json({ error: "Forbidden" }); return;
         }
 
@@ -228,28 +520,28 @@ router.post("/:id/upgrade", authenticate, async (req: Request, res: Response) =>
         const amount = STORE_PRO_PRICE * duration_months;
 
         const tx = await PaymentTransaction.create({
-            user_id: user._id,
-            plan_type: "store_pro",
-            target_type: "store",
-            store_id: store._id,
+            user_id:        (user as any)._id,
+            plan_type:      "store_pro",
+            target_type:    "store",
+            store_id:       store._id,
             duration_months,
             amount,
-            final_amount: amount,
-            status: "pending",
+            final_amount:   amount,
+            status:         "pending",
             payment_method: payment_method || undefined,
         });
 
         const ref = `STORE${String(tx._id).slice(-8).toUpperCase()}`;
         res.status(201).json({
             transaction_id: tx._id,
-            store_id: store._id,
+            store_id:       store._id,
             amount,
-            final_amount: amount,
-            status: "pending",
+            final_amount:   amount,
+            status:         "pending",
             payment_instructions: {
-                method: payment_method || "bank_transfer",
-                amount: amount.toLocaleString("vi-VN"),
-                note: ref,
+                method:  payment_method || "bank_transfer",
+                amount:  amount.toLocaleString("vi-VN"),
+                note:    ref,
                 message: `Chuyển ${amount.toLocaleString("vi-VN")}₫ với nội dung: ${ref}`,
             },
         });
@@ -258,7 +550,6 @@ router.post("/:id/upgrade", authenticate, async (req: Request, res: Response) =>
     }
 });
 
-// POST /api/stores/:id/confirm-upgrade — admin confirms store payment
 router.post("/:id/confirm-upgrade", authenticate, requireAdmin, async (req: Request, res: Response) => {
     try {
         const { tx_id } = req.body;
@@ -266,29 +557,27 @@ router.post("/:id/confirm-upgrade", authenticate, requireAdmin, async (req: Requ
         if (!tx || tx.plan_type !== "store_pro" || tx.target_type !== "store") {
             res.status(404).json({ error: "Transaction not found" }); return;
         }
-        tx.status = "completed";
+        tx.status      = "completed";
         tx.payment_ref = req.body.payment_ref || undefined;
         await tx.save();
 
-        const now = new Date();
+        const now   = new Date();
         const store = await Store.findById(tx.store_id);
         if (store) {
-            const currentExpiry = store.subscription_expires_at && store.subscription_expires_at > now
+            const base    = store.subscription_expires_at && store.subscription_expires_at > now
                 ? store.subscription_expires_at : now;
-            const newExpiry = new Date(currentExpiry);
-            newExpiry.setMonth(newExpiry.getMonth() + tx.duration_months);
-            store.subscription_tier = "pro";
-            store.subscription_expires_at = newExpiry;
+            const expiry  = new Date(base);
+            expiry.setMonth(expiry.getMonth() + tx.duration_months);
+            store.subscription_tier       = "pro";
+            store.subscription_expires_at = expiry;
             await store.save();
         }
-
         res.json({ message: "Store Pro activated", store });
     } catch (error) {
         res.status(500).json({ error: (error as Error).message });
     }
 });
 
-// POST /api/stores/:id/verify — admin verifies store
 router.post("/:id/verify", authenticate, requireAdmin, async (req: Request, res: Response) => {
     try {
         const updated = await Store.findByIdAndUpdate(

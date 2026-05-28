@@ -5,8 +5,22 @@ import { IUser } from "../models/User";
 import User from "../models/User";
 import PaymentTransaction, { IPaymentTransaction, PlanType } from "../models/PaymentTransaction";
 import DiscountCode from "../models/DiscountCode";
+import SystemSettings from "../models/SystemSettings";
 import { PayOS } from "@payos/node";
 import { sendPaymentConfirmed } from "../services/emailService";
+
+// Returns the active global discount percentage (0 if none, expired, or plan not in applicable_plans)
+async function getGlobalDiscountPct(planType?: string): Promise<number> {
+    try {
+        const doc = await SystemSettings.findOne({ key: "global" });
+        if (!doc || doc.global_discount_pct <= 0) return 0;
+        if (doc.global_discount_expires && doc.global_discount_expires < new Date()) return 0;
+        if (planType && doc.applicable_plans?.length > 0 && !doc.applicable_plans.includes(planType)) return 0;
+        return doc.global_discount_pct;
+    } catch {
+        return 0;
+    }
+}
 
 const router = Router();
 
@@ -30,8 +44,8 @@ function getPayOS(): PayOS {
 // ── Plan config ────────────────────────────────────────────────────────────────
 
 const PLANS: Record<PlanType, { name: string; price_monthly: number; tier: string }> = {
-    premium: { name: "Premium", price_monthly: 79000, tier: "premium" },
-    pro:     { name: "Pro",     price_monthly: 179000, tier: "pro" },
+    premium: { name: "Premium", price_monthly: 59000, tier: "premium" },
+    pro:     { name: "Pro",     price_monthly: 119000, tier: "pro" },
     store_pro: { name: "Store Pro", price_monthly: 49000, tier: "pro" },
 };
 
@@ -108,8 +122,10 @@ function getPaymentInstructions(method: string, amount: number, ref: string) {
 // ── Routes ────────────────────────────────────────────────────────────────────
 
 // GET /api/subscription/plans
-router.get("/plans", (_req, res) => {
+router.get("/plans", async (_req, res) => {
+    const globalPct = await getGlobalDiscountPct();
     res.json({
+        global_discount_pct: globalPct,
         user_plans: [
             {
                 id: "free",
@@ -126,10 +142,12 @@ router.get("/plans", (_req, res) => {
             {
                 id: "premium",
                 name: "Premium",
-                price_monthly: 79000,
+                price_monthly: 59000,
                 features: {
-                    scan_limit: 10,
-                    scan_cooldown_min: 30,
+                    scan_limit: 5,
+                    scan_cooldown_min: null,
+                    meal_plan_ai_daily: 1,
+                    chat_limit: 100,
                     manual_log_limit: null,
                     scan_history_days: 30,
                     ads: false,
@@ -146,10 +164,12 @@ router.get("/plans", (_req, res) => {
             {
                 id: "pro",
                 name: "Pro",
-                price_monthly: 179000,
+                price_monthly: 119000,
                 features: {
-                    scan_limit: 20,
-                    scan_cooldown_min: 15,
+                    scan_limit: -1,
+                    scan_cooldown_min: null,
+                    meal_plan_ai_daily: 5,
+                    chat_limit: -1,
                     manual_log_limit: null,
                     scan_history_days: 90,
                     ads: false,
@@ -245,11 +265,42 @@ router.post("/upgrade", authenticate, async (req: Request, res: Response) => {
             return;
         }
 
+        // ── Guard: block duplicate pending transactions (PM-01) ─────────────
+        // If a pending transaction for the same plan was created within the last
+        // 2 hours, return it instead of creating a duplicate.
+        const twoHoursAgo = new Date(Date.now() - 2 * 60 * 60 * 1000);
+        const existingPending = await PaymentTransaction.findOne({
+            user_id: user._id,
+            plan_type,
+            target_type: "user",
+            status: "pending",
+            created_at: { $gte: twoHoursAgo },
+        }).sort({ created_at: -1 });
+
+        if (existingPending) {
+            res.status(409).json({
+                error: "pending_transaction_exists",
+                message: "Bạn đã có giao dịch đang chờ thanh toán. Vui lòng hoàn tất hoặc đợi 2 giờ trước khi tạo mới.",
+                tx_id: existingPending._id,
+                payment_ref: buildRef(String(existingPending._id)),
+                amount: existingPending.final_amount,
+                payment_method: existingPending.payment_method,
+                created_at: existingPending.created_at,
+            });
+            return;
+        }
+
         const plan = PLANS[plan_type as PlanType];
         let baseAmount = plan.price_monthly * Number(duration_months);
         let finalAmount = baseAmount;
 
-        // Apply discount code
+        // Apply global system-wide discount first (respects applicable_plans)
+        const globalPct = await getGlobalDiscountPct(plan_type);
+        if (globalPct > 0) {
+            finalAmount = Math.round(finalAmount * (1 - globalPct / 100));
+        }
+
+        // Then apply user's discount code on top
         if (discount_code) {
             const code = await DiscountCode.findOne({
                 code: discount_code.toUpperCase(),
@@ -497,6 +548,26 @@ router.get("/admin/pending", authenticate, requireAdmin, async (_req, res: Respo
             .populate("user_id", "display_name email")
             .sort({ created_at: -1 });
         res.json({ data: txs });
+    } catch (error) {
+        res.status(500).json({ error: (error as Error).message });
+    }
+});
+
+// ── IAP webhook (mobile u2192 server after RevenueCat purchase) ─────────────────
+// Called optimistically by the mobile app; real entitlement sync goes through
+// the RevenueCat server-to-server webhook configured in the RC dashboard.
+router.post("/iap-webhook", authenticate, async (req: Request, res: Response) => {
+    try {
+        const user = req.user as IUser;
+        const { tier } = req.body as { tier?: string; platform?: string; customer_id?: string };
+
+        if (!tier || !["premium", "pro", "free"].includes(tier)) {
+            return res.status(400).json({ error: "Invalid tier" });
+        }
+
+        await User.findByIdAndUpdate(user._id, { subscription_tier: tier });
+
+        res.json({ ok: true, tier });
     } catch (error) {
         res.status(500).json({ error: (error as Error).message });
     }

@@ -6,14 +6,18 @@ import { requireAdminOrModerator, requireAdmin } from "../middleware/roleCheck";
 import { IUser } from "../models/User";
 import Food from "../models/Food";
 import FoodGroup from "../models/FoodGroup";
+import UsdaFood from "../models/UsdaFood";
+
+const WWEIA_EXCLUDE = ["Baby food", "Infant formula", "Alcoholic beverages", "Dietary supplements"];
 
 const router = Router();
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 20 * 1024 * 1024 } });
 
 // GET /api/foods — list with search/filter
+// include_usda=true: supplement with UsdaFood when local results are sparse
 router.get("/", async (req: Request, res: Response) => {
     try {
-        const { q, food_group_id, is_approved, limit = 50, offset = 0 } = req.query;
+        const { q, food_group_id, is_approved, limit = 50, offset = 0, include_usda } = req.query;
         const filter: Record<string, unknown> = { is_deleted: { $ne: true } };
 
         if (q) {
@@ -33,7 +37,41 @@ router.get("/", async (req: Request, res: Response) => {
             .skip(Number(offset));
 
         const total = await Food.countDocuments(filter);
-        res.json({ data: foods, total });
+
+        // USDA fallback: if few local results and caller opts in, supplement from UsdaFood
+        let data: unknown[] = foods;
+        if (include_usda === "true" && foods.length < 5 && q) {
+            const needed = 8 - foods.length;
+            const usdaRaw = await UsdaFood.find({
+                $or: [
+                    { description_vi: { $regex: q as string, $options: "i" } },
+                    { description_en: { $regex: q as string, $options: "i" } },
+                ],
+            })
+                .select("description_vi description_en energy_kcal protein lipid glucid fiber fdc_id wweia_category")
+                .limit(needed + 5)
+                .lean();
+
+            const usdaItems = usdaRaw
+                .filter((u) => !u.wweia_category || !WWEIA_EXCLUDE.some((p) => u.wweia_category!.startsWith(p)))
+                .slice(0, needed)
+                .map((u) => ({
+                    _id: u._id,
+                    name_vi: u.description_vi || u.description_en,
+                    name_en: u.description_en,
+                    energy_kcal: u.energy_kcal,
+                    protein: u.protein,
+                    lipid: u.lipid,
+                    glucid: u.glucid,
+                    fiber: u.fiber,
+                    fdc_id: u.fdc_id,
+                    source_type: "usda",
+                }));
+
+            data = [...foods, ...usdaItems];
+        }
+
+        res.json({ data, total });
     } catch (error) {
         res.status(500).json({ error: (error as Error).message });
     }

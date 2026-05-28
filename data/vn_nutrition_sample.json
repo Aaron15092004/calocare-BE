@@ -1,0 +1,522 @@
+[
+  {
+    "code": "VN-001",
+    "name_vi": "Cơm trắng (nấu chín)",
+    "name_en": "Cooked white rice",
+    "food_group": "Ngũ cốc và sản phẩm từ ngũ cốc",
+    "energy_kcal": 130,
+    "protein": 2.7,
+    "lipid": 0.3,
+    "glucid": 28.2,
+    "fiber": 0.3,
+    "water": 68.4,
+    "ash": 0.1,
+    "waste_percentage": 0,
+    "nutrients_extended": {
+      "calcium_mg": 10,
+      "iron_mg": 0.8,
+      "vitamin_b1_mg": 0.02,
+      "vitamin_b2_mg": 0.01,
+      "niacin_mg": 1.5,
+      "sodium_mg": 1
+    }
+  },
+  {
+    "code": "VN-002",
+    "name_vi": "Thịt lợn nạc (sống)",
+    "name_en": "Lean pork (raw)",
+    "food_group": "Thịt và sản phẩm từ thịt",
+    "energy_kcal": 139,
+    "protein": 19.0,
+    "lipid": 7.0,
+    "glucid": 0,
+    "fiber": 0,
+    "water": 73.0,
+    "ash": 1.0,
+    "waste_percentage": 10,
+    "nutrients_extended": {
+      "calcium_mg": 7,
+      "iron_mg": 1.5,
+      "zinc_mg": 2.9,
+      "vitamin_b1_mg": 0.53,
+      "vitamin_b12_mcg": 0.7,
+      "sodium_mg": 62
+    }
+  },
+  {
+    "code": "VN-003",
+    "name_vi": "Thịt gà (sống, bỏ da)",
+    "name_en": "Chicken breast (raw, skinless)",
+    "food_group": "Thịt và sản phẩm từ thịt",
+    "energy_kcal": 110,
+    "protein": 22.5,
+    "lipid": 2.0,
+    "glucid": 0,
+    "fiber": 0,
+    "water": 75.0,
+    "ash": 1.1,
+    "waste_percentage": 20,
+    "nutrients_extended": {
+      "calcium_mg": 11,
+      "iron_mg": 1.0,
+      "vitamin_b3_mg": 9.9,
+      "vitamin_b12_mcg": 0.3,
+      "sodium_mg": 74
+    }
+  },
+  {
+    "code": "VN-004",
+    "name_vi": "Cá tra (philê, sống)",
+    "name_en": "Pangasius fillet (raw)",
+    "food_group": "Cá và hải sản",
+    "energy_kcal": 124,
+    "protein": 15.8,
+    "lipid": 6.8,
+    "glucid": 0,
+    "fiber": 0,
+    "water": 76.5,
+    "ash": 0.9,
+    "waste_percentage": 0,
+    "nutrients_extended": {
+      "calcium_mg": 14,
+      "iron_mg": 0.4,
+      "omega3_mg": 680,
+      "sodium_mg": 55
+    }
+  },
+  {
+    "code": "VN-005",
+    "name_vi": "Trứng gà (toàn phần)",
+    "name_en": "Hen egg (whole)",
+    "food_group": "Trứng và sản phẩm từ trứng",
+    "energy_kcal": 155,
+    "protein": 13.0,
+    "lipid": 11.5,
+    "glucid": 0.5,
+    "fiber": 0,
+    "water": 74.0,
+    "ash": 1.0,
+    "waste_percentage": 13,
+    "nutrients_extended": {
+      "calcium_mg": 56,
+      "iron_mg": 2.0,
+      "vitamin_a_mcg": 140,
+      "vitamin_d_mcg": 1.2,
+      "choline_mg": 294,
+      "sodium_mg": 122
+    }
+  },
+  {
+    "code": "VN-006",
+    "name_vi": "Đậu phụ (tươi)",
+    "name_en": "Tofu (fresh)",
+    "food_group": "Đậu đỗ và sản phẩm từ đậu đỗ",
+    "energy_kcal": 76,
+    "protein": 8.0,
+    "lipid": 4.0,
+    "glucid": 1.5,
+    "fiber": 0.4,
+    "water": 85.6,
+    "ash": 0.5,
+    "waste_percentage": 0,
+    "nutrients_extended": {
+      "calcium_mg": 105,
+      "iron_mg": 1.8,
+      "magnesium_mg": 37,
+      "isoflavones_mg": 27,
+      "sodium_mg": 12
+    }
+  },
+  {
+    "code": "VN-007",
+    "name_vi": "Rau muống (sống)",
+    "name_en": "Water spinach (raw)",
+    "food_group": "Rau và sản phẩm từ rau",
+    "energy_kcal": 23,
+    "protein": 2.6,
+    "lipid": 0.3,
+    "glucid": 3.2,
+    "fiber": 2.1,
+    "water": 92.5,
+    "ash": 1.4,
+    "waste_percentage": 25,
+    "nutrients_extended": {
+      "calcium_mg": 77,
+      "iron_mg": 1.6,
+      "vitamin_c_mg": 30,
+      "vitamin_a_mcg": 300,
+      "potassium_mg": 312
+    }
+  },
+  {
+    "code": "VN-008",
+    "name_vi": "Cải xanh (sống)",
+    "name_en": "Mustard greens (raw)",
+    "food_group": "Rau và sản phẩm từ rau",
+    "energy_kcal": 22,
+    "protein": 2.4,
+    "lipid": 0.2,
+    "glucid": 2.8,
+    "fiber": 2.0,
+    "water": 92.0,
+    "ash": 1.6,
+    "waste_percentage": 20,
+    "nutrients_extended": {
+      "calcium_mg": 105,
+      "iron_mg": 1.1,
+      "vitamin_c_mg": 70,
+      "vitamin_k_mcg": 110,
+      "folate_mcg": 187
+    }
+  },
+  {
+    "code": "VN-009",
+    "name_vi": "Chuối tiêu (chín)",
+    "name_en": "Banana (ripe)",
+    "food_group": "Quả và sản phẩm từ quả",
+    "energy_kcal": 89,
+    "protein": 1.1,
+    "lipid": 0.3,
+    "glucid": 22.8,
+    "fiber": 2.6,
+    "water": 74.9,
+    "ash": 0.8,
+    "waste_percentage": 30,
+    "nutrients_extended": {
+      "calcium_mg": 5,
+      "iron_mg": 0.3,
+      "potassium_mg": 358,
+      "vitamin_b6_mg": 0.37,
+      "vitamin_c_mg": 8.7,
+      "magnesium_mg": 27
+    }
+  },
+  {
+    "code": "VN-010",
+    "name_vi": "Xoài (chín)",
+    "name_en": "Mango (ripe)",
+    "food_group": "Quả và sản phẩm từ quả",
+    "energy_kcal": 65,
+    "protein": 0.5,
+    "lipid": 0.3,
+    "glucid": 17.0,
+    "fiber": 1.8,
+    "water": 81.7,
+    "ash": 0.5,
+    "waste_percentage": 25,
+    "nutrients_extended": {
+      "calcium_mg": 10,
+      "iron_mg": 0.2,
+      "vitamin_c_mg": 36,
+      "vitamin_a_mcg": 54,
+      "folate_mcg": 43
+    }
+  },
+  {
+    "code": "VN-011",
+    "name_vi": "Sữa bò tươi",
+    "name_en": "Fresh cow milk",
+    "food_group": "Sữa và sản phẩm từ sữa",
+    "energy_kcal": 61,
+    "protein": 3.2,
+    "lipid": 3.2,
+    "glucid": 4.8,
+    "fiber": 0,
+    "water": 88.2,
+    "ash": 0.6,
+    "waste_percentage": 0,
+    "nutrients_extended": {
+      "calcium_mg": 120,
+      "iron_mg": 0.05,
+      "vitamin_a_mcg": 28,
+      "vitamin_d_mcg": 0.1,
+      "vitamin_b2_mg": 0.18,
+      "sodium_mg": 44
+    }
+  },
+  {
+    "code": "VN-012",
+    "name_vi": "Bánh mì trắng",
+    "name_en": "White bread",
+    "food_group": "Ngũ cốc và sản phẩm từ ngũ cốc",
+    "energy_kcal": 265,
+    "protein": 8.5,
+    "lipid": 3.2,
+    "glucid": 50.0,
+    "fiber": 2.3,
+    "water": 34.5,
+    "ash": 1.8,
+    "waste_percentage": 0,
+    "nutrients_extended": {
+      "calcium_mg": 100,
+      "iron_mg": 3.5,
+      "vitamin_b1_mg": 0.3,
+      "sodium_mg": 490
+    }
+  },
+  {
+    "code": "VN-013",
+    "name_vi": "Mì ăn liền (khô)",
+    "name_en": "Instant noodles (dry)",
+    "food_group": "Ngũ cốc và sản phẩm từ ngũ cốc",
+    "energy_kcal": 460,
+    "protein": 9.5,
+    "lipid": 18.0,
+    "glucid": 65.0,
+    "fiber": 2.0,
+    "water": 5.0,
+    "ash": 2.5,
+    "waste_percentage": 0,
+    "nutrients_extended": {
+      "calcium_mg": 35,
+      "iron_mg": 2.0,
+      "sodium_mg": 1800
+    }
+  },
+  {
+    "code": "VN-014",
+    "name_vi": "Dầu ăn (dầu đậu nành)",
+    "name_en": "Cooking oil (soybean)",
+    "food_group": "Dầu mỡ",
+    "energy_kcal": 884,
+    "protein": 0,
+    "lipid": 100,
+    "glucid": 0,
+    "fiber": 0,
+    "water": 0,
+    "ash": 0,
+    "waste_percentage": 0,
+    "nutrients_extended": {
+      "vitamin_e_mg": 8.2,
+      "omega6_mg": 54000,
+      "omega3_mg": 7000
+    }
+  },
+  {
+    "code": "VN-015",
+    "name_vi": "Tôm sú (sống, bỏ vỏ)",
+    "name_en": "Giant tiger prawn (raw, peeled)",
+    "food_group": "Cá và hải sản",
+    "energy_kcal": 99,
+    "protein": 20.3,
+    "lipid": 1.7,
+    "glucid": 0.9,
+    "fiber": 0,
+    "water": 76.0,
+    "ash": 1.1,
+    "waste_percentage": 40,
+    "nutrients_extended": {
+      "calcium_mg": 76,
+      "iron_mg": 1.8,
+      "zinc_mg": 1.1,
+      "selenium_mcg": 38,
+      "omega3_mg": 510,
+      "sodium_mg": 119
+    }
+  },
+  {
+    "code": "VN-016",
+    "name_vi": "Đậu xanh (hạt, khô)",
+    "name_en": "Mung beans (dried)",
+    "food_group": "Đậu đỗ và sản phẩm từ đậu đỗ",
+    "energy_kcal": 347,
+    "protein": 23.9,
+    "lipid": 1.2,
+    "glucid": 59.2,
+    "fiber": 16.3,
+    "water": 10.8,
+    "ash": 3.8,
+    "waste_percentage": 0,
+    "nutrients_extended": {
+      "calcium_mg": 132,
+      "iron_mg": 6.7,
+      "magnesium_mg": 189,
+      "folate_mcg": 625,
+      "potassium_mg": 1246
+    }
+  },
+  {
+    "code": "VN-017",
+    "name_vi": "Khoai lang (sống)",
+    "name_en": "Sweet potato (raw)",
+    "food_group": "Củ và sản phẩm từ củ",
+    "energy_kcal": 86,
+    "protein": 1.6,
+    "lipid": 0.1,
+    "glucid": 20.1,
+    "fiber": 3.0,
+    "water": 77.3,
+    "ash": 0.9,
+    "waste_percentage": 18,
+    "nutrients_extended": {
+      "calcium_mg": 30,
+      "iron_mg": 0.6,
+      "vitamin_a_mcg": 961,
+      "vitamin_c_mg": 2.4,
+      "potassium_mg": 337
+    }
+  },
+  {
+    "code": "VN-018",
+    "name_vi": "Phở bò (cả bát)",
+    "name_en": "Beef pho (full bowl)",
+    "food_group": "Món ăn truyền thống Việt Nam",
+    "energy_kcal": 215,
+    "protein": 12.5,
+    "lipid": 5.0,
+    "glucid": 30.0,
+    "fiber": 1.5,
+    "water": 70.0,
+    "ash": 2.0,
+    "waste_percentage": 0,
+    "notes": "Giá trị dinh dưỡng trung bình cho 1 bát phở bò cỡ thường (~400g).",
+    "nutrients_extended": {
+      "calcium_mg": 45,
+      "iron_mg": 2.5,
+      "sodium_mg": 1200
+    }
+  },
+  {
+    "code": "VN-019",
+    "name_vi": "Bún bò Huế (cả bát)",
+    "name_en": "Hue beef noodle soup (full bowl)",
+    "food_group": "Món ăn truyền thống Việt Nam",
+    "energy_kcal": 280,
+    "protein": 15.0,
+    "lipid": 9.0,
+    "glucid": 33.0,
+    "fiber": 1.2,
+    "water": 65.0,
+    "ash": 2.5,
+    "waste_percentage": 0,
+    "notes": "Giá trị dinh dưỡng trung bình cho 1 bát bún bò Huế cỡ thường (~450g).",
+    "nutrients_extended": {
+      "calcium_mg": 52,
+      "iron_mg": 2.8,
+      "sodium_mg": 1450
+    }
+  },
+  {
+    "code": "VN-020",
+    "name_vi": "Gỏi cuốn (1 cuốn)",
+    "name_en": "Fresh spring roll (1 roll)",
+    "food_group": "Món ăn truyền thống Việt Nam",
+    "energy_kcal": 80,
+    "protein": 5.5,
+    "lipid": 1.5,
+    "glucid": 11.0,
+    "fiber": 1.0,
+    "water": 65.0,
+    "ash": 0.8,
+    "waste_percentage": 0,
+    "notes": "1 cuốn gỏi cuốn tôm thịt (~70g): bánh tráng, bún, tôm, thịt heo, rau sống.",
+    "nutrients_extended": {
+      "calcium_mg": 28,
+      "iron_mg": 0.8,
+      "sodium_mg": 180
+    }
+  },
+  {
+    "code": "VN-021",
+    "name_vi": "Chả giò chiên (1 cái)",
+    "name_en": "Fried spring roll (1 piece)",
+    "food_group": "Món ăn truyền thống Việt Nam",
+    "energy_kcal": 110,
+    "protein": 4.5,
+    "lipid": 6.5,
+    "glucid": 8.5,
+    "fiber": 0.8,
+    "water": 42.0,
+    "ash": 0.7,
+    "waste_percentage": 0,
+    "notes": "1 cái chả giò chiên cỡ trung (~60g).",
+    "nutrients_extended": {
+      "calcium_mg": 20,
+      "iron_mg": 0.9,
+      "sodium_mg": 280
+    }
+  },
+  {
+    "code": "VN-022",
+    "name_vi": "Cơm tấm sườn bì (1 đĩa)",
+    "name_en": "Broken rice with grilled pork ribs (1 plate)",
+    "food_group": "Món ăn truyền thống Việt Nam",
+    "energy_kcal": 620,
+    "protein": 28.0,
+    "lipid": 18.0,
+    "glucid": 85.0,
+    "fiber": 2.0,
+    "water": 45.0,
+    "ash": 3.0,
+    "waste_percentage": 0,
+    "notes": "1 đĩa cơm tấm sườn bì chả (~400g): cơm tấm, sườn nướng, bì, chả, trứng, mỡ hành.",
+    "nutrients_extended": {
+      "calcium_mg": 65,
+      "iron_mg": 3.5,
+      "sodium_mg": 1350
+    }
+  },
+  {
+    "code": "VN-023",
+    "name_vi": "Canh rau ngót thịt",
+    "name_en": "Sauropus androgynous pork soup",
+    "food_group": "Món ăn truyền thống Việt Nam",
+    "energy_kcal": 45,
+    "protein": 4.5,
+    "lipid": 1.8,
+    "glucid": 3.0,
+    "fiber": 1.5,
+    "water": 88.0,
+    "ash": 1.2,
+    "waste_percentage": 0,
+    "notes": "100g canh rau ngót nấu thịt.",
+    "nutrients_extended": {
+      "calcium_mg": 60,
+      "iron_mg": 1.0,
+      "vitamin_c_mg": 45,
+      "sodium_mg": 350
+    }
+  },
+  {
+    "code": "VN-024",
+    "name_vi": "Bắp ngô luộc (1 bắp)",
+    "name_en": "Boiled corn (1 ear)",
+    "food_group": "Ngũ cốc và sản phẩm từ ngũ cốc",
+    "energy_kcal": 123,
+    "protein": 4.2,
+    "lipid": 1.6,
+    "glucid": 26.0,
+    "fiber": 3.6,
+    "water": 69.0,
+    "ash": 0.7,
+    "waste_percentage": 30,
+    "notes": "1 bắp ngô luộc khoảng 150g hạt.",
+    "nutrients_extended": {
+      "calcium_mg": 2,
+      "iron_mg": 0.5,
+      "vitamin_c_mg": 7,
+      "potassium_mg": 270,
+      "folate_mcg": 46
+    }
+  },
+  {
+    "code": "VN-025",
+    "name_vi": "Nước mắm (nguyên chất)",
+    "name_en": "Fish sauce (pure)",
+    "food_group": "Gia vị và nước chấm",
+    "energy_kcal": 35,
+    "protein": 5.0,
+    "lipid": 0,
+    "glucid": 3.5,
+    "fiber": 0,
+    "water": 65.0,
+    "ash": 26.5,
+    "waste_percentage": 0,
+    "notes": "Per 100ml. Sodium rất cao — sử dụng hạn chế.",
+    "nutrients_extended": {
+      "sodium_mg": 10000,
+      "calcium_mg": 15,
+      "iron_mg": 0.8
+    }
+  }
+]

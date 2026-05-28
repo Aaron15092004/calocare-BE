@@ -7,6 +7,7 @@ export interface IUserMealPlanItem extends Document {
     recipe_id?: Types.ObjectId;
     food_id?: Types.ObjectId;
     serving_size?: number;
+    calories?: number;
     sort_order: number;
     created_at: Date;
     updated_at: Date;
@@ -29,6 +30,7 @@ const UserMealPlanItemSchema = new Schema<IUserMealPlanItem>(
         recipe_id: { type: Schema.Types.ObjectId, ref: "Recipe" },
         food_id: { type: Schema.Types.ObjectId, ref: "Food" },
         serving_size: { type: Number },
+        calories: { type: Number },
         sort_order: { type: Number, default: 0 },
     },
     {

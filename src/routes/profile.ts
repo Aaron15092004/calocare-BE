@@ -1,4 +1,5 @@
 import { Router, Request, Response } from "express";
+import { z } from "zod";
 import { authenticate } from "../middleware/auth";
 import User, { IUser } from "../models/User";
 
@@ -60,6 +61,43 @@ router.put("/", authenticate, async (req: Request, res: Response) => {
     } catch (error) {
         res.status(500).json({ error: (error as Error).message });
     }
+});
+
+// PATCH /api/profile/preferences — merge dietary/RAG preferences
+const PreferencesSchema = z.object({
+    dietary_preference: z.enum(["omnivore", "vegetarian", "vegan"]).optional(),
+    allergies: z.array(z.string().max(50)).max(20).optional(),
+    disliked_foods: z.array(z.string().max(50)).max(20).optional(),
+    cuisine_preferences: z.array(z.string().max(50)).max(10).optional(),
+    health_conditions: z.array(z.string().max(100)).max(10).optional(),
+});
+
+router.patch("/preferences", authenticate, async (req: Request, res: Response) => {
+    const parsed = PreferencesSchema.safeParse(req.body);
+    if (!parsed.success) {
+        res.status(400).json({ error: "Invalid preferences", details: parsed.error.flatten() });
+        return;
+    }
+
+    const user = req.user as IUser;
+
+    // Merge into existing preferences (keep other keys intact)
+    const updated = await User.findByIdAndUpdate(
+        user._id,
+        { $set: Object.fromEntries(
+            Object.entries(parsed.data)
+                .filter(([, v]) => v !== undefined)
+                .map(([k, v]) => [`preferences.${k}`, v]),
+        ) },
+        { new: true },
+    ).lean();
+
+    if (!updated) {
+        res.status(404).json({ error: "User not found" });
+        return;
+    }
+
+    res.json({ ok: true, preferences: updated.preferences });
 });
 
 export default router;

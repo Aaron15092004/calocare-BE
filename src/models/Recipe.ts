@@ -25,9 +25,25 @@ export interface IRecipe extends Document {
     carbs?: number;
     fat?: number;
     fiber?: number;
+    total_weight?: number;   // total gram weight of all ingredients (for per-100g normalization)
+    nutrition_source?: "ingredients" | "manual";  // "ingredients" = computed from RecipeIngredients; "manual" = stored directly (e.g. USDA)
+    nutrients_extended?: {
+        minerals?: Record<string, number>;
+        vitamins?: Record<string, number>;
+        fats?: Record<string, number>;
+        [key: string]: unknown;
+    };
     // Images: images[0] is the cover; extra images used for AI training
     image_url?: string;   // kept for backward compat (mirrors images[0])
     images: string[];
+    image_attribution?: {
+        source: string;               // e.g. "unsplash"
+        photographer_name: string;
+        photographer_url: string;     // includes utm params
+        photo_url: string;            // includes utm params
+        download_location: string;    // Unsplash tracking endpoint (ToS required)
+    };
+    source_reference?: string;  // e.g. "FS-{food_id}" for FatSecret-sourced recipes
     // Engagement
     view_count: number;
     average_rating: number;
@@ -39,7 +55,7 @@ export interface IRecipe extends Document {
 
 const RecipeSchema = new Schema<IRecipe>(
     {
-        code: { type: String, sparse: true },
+        code: { type: String, unique: true, sparse: true },
         name_vi: { type: String, required: true, index: true },
         name_en: { type: String },
         description: { type: String },
@@ -62,8 +78,19 @@ const RecipeSchema = new Schema<IRecipe>(
         carbs: { type: Number },
         fat: { type: Number },
         fiber: { type: Number },
+        total_weight: { type: Number },
+        nutrition_source: { type: String, enum: ["ingredients", "manual"] },
+        nutrients_extended: { type: Schema.Types.Mixed },
         image_url: { type: String },
         images: [{ type: String }],
+        image_attribution: {
+            source: { type: String },
+            photographer_name: { type: String },
+            photographer_url: { type: String },
+            photo_url: { type: String },
+            download_location: { type: String },
+        },
+        source_reference: { type: String, sparse: true, index: true },
         view_count: { type: Number, default: 0 },
         average_rating: { type: Number, default: 0 },
         rating_count: { type: Number, default: 0 },

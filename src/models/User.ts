@@ -15,7 +15,7 @@ export interface IUser extends Document {
     google_id?: string;
     display_name: string;
     avatar_url?: string;
-    role: "user" | "admin" | "moderator";
+    role: "user" | "admin" | "moderator" | "store_owner";
     subscription_tier: "free" | "premium" | "pro";
     subscription_expires_at?: Date;
     is_banned: boolean;
@@ -23,6 +23,7 @@ export interface IUser extends Document {
     daily_nutrition_goals: INutritionGoals;
     preferences: Record<string, unknown>;
     refresh_tokens: string[];
+    referral_code?: string;
     created_at: Date;
     updated_at: Date;
     comparePassword(candidatePassword: string): Promise<boolean>;
@@ -35,7 +36,7 @@ const UserSchema = new Schema<IUser>(
         google_id: { type: String, sparse: true },
         display_name: { type: String, required: true, trim: true },
         avatar_url: { type: String },
-        role: { type: String, enum: ["user", "admin", "moderator"], default: "user" },
+        role: { type: String, enum: ["user", "admin", "moderator", "store_owner"], default: "user" },
         subscription_tier: { type: String, enum: ["free", "premium", "pro"], default: "free" },
         subscription_expires_at: { type: Date },
         is_banned: { type: Boolean, default: false },
@@ -49,6 +50,7 @@ const UserSchema = new Schema<IUser>(
         },
         preferences: { type: Schema.Types.Mixed, default: {} },
         refresh_tokens: [{ type: String, select: false }],
+        referral_code: { type: String, sparse: true, unique: true },
     },
     {
         timestamps: { createdAt: "created_at", updatedAt: "updated_at" },

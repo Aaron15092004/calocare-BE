@@ -2,7 +2,7 @@ import mongoose, { Schema, Document, Types } from "mongoose";
 
 export interface IFoodItem {
     dish_name: string;
-    source: "recipe" | "food" | "ai_estimate";
+    source: "recipe" | "food" | "ai_estimate" | "usda" | "fatsecret";
     matched_name?: string;
     nutrition: {
         calories: number;
@@ -15,6 +15,7 @@ export interface IFoodItem {
     servings?: number;
     recipe_id?: Types.ObjectId;
     food_id?: Types.ObjectId;
+    usda_fdc_id?: number;
 }
 
 export interface IFoodDiary extends Document {
@@ -46,8 +47,9 @@ const FoodDiarySchema = new Schema<IFoodDiary>(
         foods: [
             {
                 dish_name: String,
-                source: { type: String, enum: ["recipe", "food", "ai_estimate"] },
+                source: { type: String, enum: ["recipe", "food", "ai_estimate", "usda", "fatsecret"] },
                 matched_name: String,
+                usda_fdc_id: { type: Number },
                 nutrition: {
                     calories: { type: Number, default: 0 },
                     protein: { type: Number, default: 0 },
