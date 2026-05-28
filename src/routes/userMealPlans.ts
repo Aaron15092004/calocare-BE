@@ -39,7 +39,7 @@ router.get("/active-with-items", authenticate, async (req: Request, res: Respons
             items = await MealPlanItem.find({ meal_plan_id: mealPlanId })
                 .populate(ITEM_POPULATE)
                 .sort({ day_number: 1, sort_order: 1 })
-                .lean() as typeof items;
+                .lean() as unknown as typeof items;
         }
 
         res.set("Cache-Control", "private, max-age=0, must-revalidate");
@@ -87,7 +87,7 @@ router.get("/:id/items", authenticate, async (req: Request, res: Response) => {
             items = await MealPlanItem.find({ meal_plan_id: plan.meal_plan_id })
                 .populate(ITEM_POPULATE)
                 .sort({ day_number: 1, sort_order: 1 })
-                .lean() as typeof items;
+                .lean() as unknown as typeof items;
         }
 
         res.json(items);

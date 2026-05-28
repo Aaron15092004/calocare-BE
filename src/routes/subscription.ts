@@ -437,9 +437,9 @@ router.post("/webhook/bank", async (req: Request, res: Response) => {
 router.post("/webhook/payos", async (req: Request, res: Response) => {
     try {
         // Throws PayOS.InvalidSignatureError when signature is wrong
-        let webhookData: Awaited<ReturnType<typeof getPayOS>["webhooks"]["verify"]>;
+        let webhookData: { code?: string; orderCode?: string | number; reference?: string };
         try {
-            webhookData = await getPayOS().webhooks.verify(req.body);
+            webhookData = await getPayOS().webhooks.verify(req.body) as typeof webhookData;
         } catch {
             res.status(400).json({ error: "Invalid webhook signature" });
             return;
