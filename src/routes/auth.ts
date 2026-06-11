@@ -2,6 +2,22 @@ import { Router, Request, Response } from "express";
 import passport from "passport";
 import rateLimit from "express-rate-limit";
 import User, { IUser } from "../models/User";
+import ChatSession from "../models/ChatSession";
+import FoodDiary from "../models/FoodDiary";
+import MealProgress from "../models/MealProgress";
+import PaymentTransaction from "../models/PaymentTransaction";
+import ReportDigest from "../models/ReportDigest";
+import Review from "../models/Review";
+import Referral from "../models/Referral";
+import UserFavorite from "../models/UserFavorite";
+import UserMealPlan from "../models/UserMealPlan";
+import UserMealPlanItem from "../models/UserMealPlanItem";
+import MealPlan from "../models/MealPlan";
+import MealPlanItem from "../models/MealPlanItem";
+import Store from "../models/Store";
+import Recipe from "../models/Recipe";
+import Food from "../models/Food";
+import EnrichmentQueue from "../models/EnrichmentQueue";
 import { generateAccessToken, generateRefreshToken, verifyRefreshToken } from "../utils/jwt";
 import { authenticate } from "../middleware/auth";
 
@@ -12,6 +28,43 @@ const authLimiter = rateLimit({
     max: 20,
     message: { error: "Too many requests, please try again later" },
 });
+
+async function recalcRatingsForTargets(
+    targets: Array<{ target_type: "recipe" | "store"; target_id: string }>,
+) {
+    const uniqueTargets = new Map<string, { target_type: "recipe" | "store"; target_id: string }>();
+    for (const target of targets) {
+        uniqueTargets.set(`${target.target_type}:${target.target_id}`, target);
+    }
+
+    await Promise.all(
+        Array.from(uniqueTargets.values()).map(async ({ target_type, target_id }) => {
+            const agg = await Review.aggregate([
+                {
+                    $match: {
+                        target_type,
+                        target_id: userObjectId(target_id),
+                        is_deleted: false,
+                    },
+                },
+                { $group: { _id: null, avg: { $avg: "$rating" }, count: { $sum: 1 } } },
+            ]);
+
+            const average = Math.round((agg[0]?.avg ?? 0) * 10) / 10;
+            const count = agg[0]?.count ?? 0;
+
+            if (target_type === "recipe") {
+                await Recipe.findByIdAndUpdate(target_id, { average_rating: average, rating_count: count });
+            } else {
+                await Store.findByIdAndUpdate(target_id, { average_rating: average, rating_count: count });
+            }
+        }),
+    );
+}
+
+function userObjectId(id: string) {
+    return User.db.base.Types.ObjectId.createFromHexString(id);
+}
 
 // POST /api/auth/register
 router.post("/register", authLimiter, async (req: Request, res: Response) => {
@@ -132,6 +185,66 @@ router.post("/logout", authenticate, async (req: Request, res: Response) => {
             await User.findByIdAndUpdate(user._id, { $pull: { refresh_tokens: refresh_token } });
         }
         res.json({ message: "Logged out successfully" });
+    } catch (error) {
+        res.status(500).json({ error: (error as Error).message });
+    }
+});
+
+// DELETE /api/auth/account
+router.delete("/account", authenticate, async (req: Request, res: Response) => {
+    try {
+        const user = req.user as IUser;
+        const confirmation = typeof req.body?.confirmation === "string" ? req.body.confirmation.trim() : "";
+
+        if (confirmation !== "DELETE") {
+            res.status(400).json({ error: "confirmation must be DELETE" });
+            return;
+        }
+
+        const userId = user._id.toString();
+        const userObjectIdValue = userObjectId(userId);
+
+        const [ownedStores, ownedMealPlans, ownReviews, userMealPlans] = await Promise.all([
+            Store.find({ owner_id: userObjectIdValue }).select("_id").lean(),
+            MealPlan.find({ creator_id: userObjectIdValue }).select("_id").lean(),
+            Review.find({ user_id: userObjectIdValue, is_deleted: false }).select("target_type target_id").lean(),
+            UserMealPlan.find({ user_id: userObjectIdValue }).select("_id").lean(),
+        ]);
+
+        const ownedStoreIds = ownedStores.map((store) => store._id);
+        const ownedMealPlanIds = ownedMealPlans.map((plan) => plan._id);
+        const userMealPlanIds = userMealPlans.map((plan) => plan._id);
+
+        await Promise.all([
+            ChatSession.deleteMany({ user_id: userObjectIdValue }),
+            FoodDiary.deleteMany({ user_id: userObjectIdValue }),
+            MealProgress.deleteMany({ user_id: userObjectIdValue }),
+            PaymentTransaction.deleteMany({ user_id: userObjectIdValue }),
+            ReportDigest.deleteMany({ user_id: userObjectIdValue }),
+            UserFavorite.deleteMany({ user_id: userObjectIdValue }),
+            Referral.deleteMany({ $or: [{ referrer_id: userObjectIdValue }, { referee_id: userObjectIdValue }] }),
+            EnrichmentQueue.deleteMany({ user_id: userObjectIdValue }),
+            Review.deleteMany({ user_id: userObjectIdValue }),
+            Review.updateMany({ helpful_votes: userObjectIdValue }, { $pull: { helpful_votes: userObjectIdValue } }),
+            UserMealPlanItem.deleteMany({ user_meal_plan_id: { $in: userMealPlanIds } }),
+            UserMealPlan.deleteMany({ user_id: userObjectIdValue }),
+            MealPlanItem.deleteMany({ meal_plan_id: { $in: ownedMealPlanIds } }),
+            MealPlan.deleteMany({ creator_id: userObjectIdValue }),
+            Review.deleteMany({ target_type: "store", target_id: { $in: ownedStoreIds } }),
+            Store.deleteMany({ owner_id: userObjectIdValue }),
+            Recipe.updateMany({ creator_id: userObjectIdValue }, { $unset: { creator_id: 1 } }),
+            Food.updateMany({ creator_id: userObjectIdValue }, { $unset: { creator_id: 1 } }),
+            User.findByIdAndDelete(userObjectIdValue),
+        ]);
+
+        await recalcRatingsForTargets(
+            ownReviews.map((review) => ({
+                target_type: review.target_type,
+                target_id: review.target_id.toString(),
+            })),
+        );
+
+        res.json({ success: true, message: "Account deleted successfully" });
     } catch (error) {
         res.status(500).json({ error: (error as Error).message });
     }
