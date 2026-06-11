@@ -45,7 +45,8 @@ function getPayOS(): PayOS {
 
 const PLANS: Record<PlanType, { name: string; price_monthly: number; tier: string }> = {
     premium: { name: "Premium", price_monthly: 59000, tier: "premium" },
-    pro:     { name: "Pro",     price_monthly: 119000, tier: "pro" },
+    family:  { name: "Family",  price_monthly: 199000, tier: "family" },
+    pro:     { name: "Family",  price_monthly: 199000, tier: "family" },
     store_pro: { name: "Store Pro", price_monthly: 49000, tier: "pro" },
 };
 
@@ -73,7 +74,7 @@ async function activateSubscription(
             : now;
         const newExpiry = new Date(base);
         newExpiry.setMonth(newExpiry.getMonth() + tx.duration_months);
-        user.subscription_tier = plan.tier as "premium" | "pro";
+        user.subscription_tier = plan.tier as "premium" | "family";
         user.subscription_expires_at = newExpiry;
         await user.save();
 
@@ -162,16 +163,16 @@ router.get("/plans", async (_req, res) => {
                 },
             },
             {
-                id: "pro",
-                name: "Pro",
-                price_monthly: 119000,
+                id: "family",
+                name: "Family",
+                price_monthly: 199000,
                 features: {
                     scan_limit: -1,
                     scan_cooldown_min: null,
                     meal_plan_ai_daily: 5,
                     chat_limit: -1,
                     manual_log_limit: null,
-                    scan_history_days: 90,
+                    scan_history_days: 180,
                     ads: false,
                     barcode_scanner: true,
                     meal_plan_ai: true,
@@ -179,6 +180,9 @@ router.get("/plans", async (_req, res) => {
                     grocery_list: true,
                     export_csv: true,
                     weekly_report: true,
+                    family_members: 5,
+                    separate_health_reports: true,
+                    expert_advice: true,
                     push_notifications: true,
                     progress_charts_months: null,
                     batch_scan: 3,
@@ -561,13 +565,15 @@ router.post("/iap-webhook", authenticate, async (req: Request, res: Response) =>
         const user = req.user as IUser;
         const { tier } = req.body as { tier?: string; platform?: string; customer_id?: string };
 
-        if (!tier || !["premium", "pro", "free"].includes(tier)) {
+        if (!tier || !["premium", "family", "pro", "free"].includes(tier)) {
             return res.status(400).json({ error: "Invalid tier" });
         }
 
-        await User.findByIdAndUpdate(user._id, { subscription_tier: tier });
+        await User.findByIdAndUpdate(user._id, {
+            subscription_tier: tier === "pro" ? "family" : tier,
+        });
 
-        res.json({ ok: true, tier });
+        res.json({ ok: true, tier: tier === "pro" ? "family" : tier });
     } catch (error) {
         res.status(500).json({ error: (error as Error).message });
     }

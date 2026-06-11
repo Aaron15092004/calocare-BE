@@ -16,6 +16,7 @@ const router = Router();
 
 const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-flash-latest";
 const GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta/models";
+const ALLOW_AI_ESTIMATE = process.env.ALLOW_ANALYZE_FOOD_AI_ESTIMATE === "true";
 
 function guessMealType(): string {
   const hour = new Date().getHours();
@@ -335,7 +336,7 @@ router.post(
         })
         .join(", ");
 
-      const nutritionPrompt = unmatched.length > 0
+      const nutritionPrompt = unmatched.length > 0 && ALLOW_AI_ESTIMATE
         ? `Estimate per-100g nutrition for: ${unmatchedNames}\nJSON only:\n{"items":[{"name":"dish","weight_grams":300,"calories_per_100g":150,"protein_per_100g":12,"carbs_per_100g":20,"fat_per_100g":5,"fiber_per_100g":2}]}`
         : null;
 
@@ -413,13 +414,14 @@ router.post(
         } catch { /* fallback below */ }
       }
 
-      // Fallback for still-unmatched (Gemini returned nothing useful)
+      // Safety fallback: when no verified source is found, do not invent nutrition by default.
       for (const r of results) {
         if (r.source === "none") {
           r.source = "ai_estimate";
           r.matched_name = r.dish_name;
           r.weight_grams = (r.weight_grams as number) || 300;
           r.nutrition = { calories: 0, protein: 0, carbs: 0, fat: 0, fiber: 0 };
+          r.unmatched = true;
         }
         delete r._name_en; // internal field, not sent to client
       }

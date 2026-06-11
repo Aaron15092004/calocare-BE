@@ -1,7 +1,7 @@
 {
-  "name": "calocare-be",
+  "name": "calovie-be",
   "version": "1.0.0",
-  "description": "CaloCare Backend API - Node.js + Express + MongoDB",
+  "description": "CaloVie Backend API - Node.js + Express + MongoDB",
   "main": "dist/app.js",
   "scripts": {
     "dev": "ts-node-dev --respawn --transpile-only src/app.ts",

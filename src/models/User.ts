@@ -16,7 +16,7 @@ export interface IUser extends Document {
     display_name: string;
     avatar_url?: string;
     role: "user" | "admin" | "moderator" | "store_owner";
-    subscription_tier: "free" | "premium" | "pro";
+    subscription_tier: "free" | "premium" | "family" | "pro";
     subscription_expires_at?: Date;
     is_banned: boolean;
     language: "vi" | "en";
@@ -37,7 +37,7 @@ const UserSchema = new Schema<IUser>(
         display_name: { type: String, required: true, trim: true },
         avatar_url: { type: String },
         role: { type: String, enum: ["user", "admin", "moderator", "store_owner"], default: "user" },
-        subscription_tier: { type: String, enum: ["free", "premium", "pro"], default: "free" },
+        subscription_tier: { type: String, enum: ["free", "premium", "family", "pro"], default: "free" },
         subscription_expires_at: { type: Date },
         is_banned: { type: Boolean, default: false },
         language: { type: String, enum: ["vi", "en"], default: "vi" },

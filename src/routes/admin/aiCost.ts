@@ -15,7 +15,7 @@ const COST_PER_SCAN = 0.0002;          // Gemini 2.0 Flash vision: ~1.1K tokens/
 const COST_PER_EMBED = 0.000001;       // Voyage voyage-4-lite: per text embedded
 
 // Chat monthly soft limits per tier (-1 = unlimited, used for usage % display in FE)
-const CHAT_LIMIT = { free: 150, premium: 100, pro: -1 };
+const CHAT_LIMIT = { free: 150, premium: 100, family: -1, pro: -1 };
 
 // GET /api/admin/ai-cost
 router.get("/", authenticate, requireAdminOrModerator, async (_req: Request, res: Response) => {
@@ -105,15 +105,15 @@ router.get("/", authenticate, requireAdminOrModerator, async (_req: Request, res
         const tierMap = new Map(userTierAgg.map((r: any) => [r._id, r.count]));
         const freeCount = tierMap.get("free") || 0;
         const premiumCount = tierMap.get("premium") || 0;
-        const proCount = tierMap.get("pro") || 0;
+        const familyCount = (tierMap.get("family") || 0) + (tierMap.get("pro") || 0);
 
         // --- Chat stats ---
-        const chatByTier = { free: 0, premium: 0, pro: 0 };
+        const chatByTier = { free: 0, premium: 0, family: 0, pro: 0 };
         chatByUserAgg.forEach((r: any) => {
             const tier = (r.user?.subscription_tier as keyof typeof chatByTier) || "free";
             if (tier in chatByTier) chatByTier[tier] += r.msg_count;
         });
-        const totalChatMessages = chatByTier.free + chatByTier.premium + chatByTier.pro;
+        const totalChatMessages = chatByTier.free + chatByTier.premium + chatByTier.family + chatByTier.pro;
         const avgMsgsPremium = premiumCount > 0 ? Math.round(chatByTier.premium / premiumCount) : 0;
         // Users at risk: premium users who have used ≥ 80% of their 100-message limit this month
         const premiumAtRisk = chatByUserAgg.filter(
@@ -167,6 +167,7 @@ router.get("/", authenticate, requireAdminOrModerator, async (_req: Request, res
                 chat_messages_by_tier: chatByTier,
                 avg_messages_per_premium_user: avgMsgsPremium,
                 premium_users_count: premiumCount,
+                family_users_count: familyCount,
                 total_meal_plans: mealPlanCount,
                 total_scans: totalScans,
                 total_embeds: totalEmbeds,
@@ -191,9 +192,9 @@ router.get("/", authenticate, requireAdminOrModerator, async (_req: Request, res
                 user_id: r._id,
                 display_name: r.user?.display_name || "—",
                 email: r.user?.email || "—",
-                tier: r.user?.subscription_tier || "free",
+                tier: r.user?.subscription_tier === "pro" ? "family" : (r.user?.subscription_tier || "free"),
                 message_count: r.msg_count,
-                chat_limit: CHAT_LIMIT[r.user?.subscription_tier as keyof typeof CHAT_LIMIT] ?? CHAT_LIMIT.free,
+                chat_limit: CHAT_LIMIT[(r.user?.subscription_tier === "pro" ? "family" : r.user?.subscription_tier) as keyof typeof CHAT_LIMIT] ?? CHAT_LIMIT.free,
                 estimated_cost_usd: +(r.msg_count * COST_PER_CHAT_MSG).toFixed(4),
             })),
         });

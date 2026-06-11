@@ -14,7 +14,7 @@ export const searchImage = async (name: string): Promise<string | null> => {
                 fields: "image_front_url,product_name",
             },
             timeout: TIMEOUT_MS,
-            headers: { "User-Agent": "CaloCare/1.0 (nutrition app; contact@calocare.vn)" },
+            headers: { "User-Agent": "CaloVie/1.0 (nutrition app; contact@CaloVie.vn)" },
         });
 
         const products: Array<{ image_front_url?: string; product_name?: string }> =

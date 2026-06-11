@@ -420,7 +420,7 @@ router.get("/:id/shopping-list", authenticate, async (req: Request, res: Respons
     }
 });
 
-// POST /api/meal-plans/generate — CaloCare AI personalized meal plan (Premium = 7d, Pro = 21d)
+// POST /api/meal-plans/generate — CaloVie AI personalized meal plan (Premium = 7d, Pro = 21d)
 router.post("/generate", authenticate, async (req: Request, res: Response) => {
     try {
         const user = req.user as IUser;
@@ -437,7 +437,8 @@ router.post("/generate", authenticate, async (req: Request, res: Response) => {
             return;
         }
 
-        const totalDays = tier === "pro" ? 21 : 7;
+        const normalizedTier = tier === "pro" ? "family" : tier;
+        const totalDays = normalizedTier === "family" ? 21 : 7;
 
         const fullUser = await User.findById(user._id);
         const prefs    = (fullUser?.preferences as Record<string, unknown>) ?? {};
@@ -494,7 +495,7 @@ router.post("/generate", authenticate, async (req: Request, res: Response) => {
             ? `\nYêu cầu thực phẩm cụ thể: ${specific_foods} — phải xuất hiện ít nhất 1 lần trong thực đơn.`
             : "";
 
-        const prompt = `Bạn là CaloCare AI – chuyên gia dinh dưỡng thông minh. Hãy tạo thực đơn cá nhân hóa ${totalDays} ngày CHI TIẾT cho người dùng sau:
+        const prompt = `Bạn là CaloVie AI – chuyên gia dinh dưỡng thông minh. Hãy tạo thực đơn cá nhân hóa ${totalDays} ngày CHI TIẾT cho người dùng sau:
 
 Hồ sơ: Tuổi ${age}, ${gender}, ${weight}kg, cao ${height}cm, hoạt động: ${activity}
 Mục tiêu: ${goalLabel[goal_type] || "Ăn uống lành mạnh"} · ${effectiveCalories} kcal/ngày
@@ -581,7 +582,7 @@ Trả lời CHỈ bằng JSON hợp lệ:
             description: parsed.description || "",
             total_days:  totalDays,
             goal_type:   parsed.goal_type || goal_type,
-            tags:        ["AI", "CaloCare AI", tier === "pro" ? "21 ngày" : "7 ngày"],
+            tags:        ["AI", "CaloVie AI", normalizedTier === "family" ? "21 ngày" : "7 ngày"],
             creator_id:  user._id,
             is_public:   false,
             is_approved: false,

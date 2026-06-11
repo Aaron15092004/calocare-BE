@@ -182,7 +182,7 @@ router.get("/", authenticate, requireAdminOrModerator, async (_req: Request, res
         }));
 
         // Subscription tier distribution
-        const tierOrder = ["free", "premium", "pro"];
+        const tierOrder = ["free", "premium", "family", "pro"];
         const tierMap = new Map(subscriptionTierAgg.map((r: any) => [r._id || "free", r.count]));
         const subscriptionTierChart = tierOrder.map((tier) => ({
             name: tier.charAt(0).toUpperCase() + tier.slice(1),

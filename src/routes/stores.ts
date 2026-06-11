@@ -1,6 +1,6 @@
 import { Router, Request, Response } from "express";
 import { parse as csvParse } from "csv-parse/sync";
-import { authenticate } from "../middleware/auth";
+import { authenticate, optionalAuthenticate } from "../middleware/auth";
 import { requireAdmin } from "../middleware/roleCheck";
 import { IUser } from "../models/User";
 import Store from "../models/Store";
@@ -27,9 +27,119 @@ function ownerStoreOrFail(store: InstanceType<typeof Store> | null, user: IUser,
     return true;
 }
 
+function normalizeText(value: string): string {
+    return value.toLowerCase();
+}
+
+function haversineKm(lat1: number, lng1: number, lat2: number, lng2: number): number {
+    const toRad = (deg: number) => deg * Math.PI / 180;
+    const dLat = toRad(lat2 - lat1);
+    const dLng = toRad(lng2 - lng1);
+    const a =
+        Math.sin(dLat / 2) ** 2
+        + Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLng / 2) ** 2;
+    return 6371 * (2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a)));
+}
+
+function getPriceRange(store: any): { min: number; max: number } | null {
+    const prices = (store.menu_items ?? [])
+        .map((item: any) => Number(item.price))
+        .filter((value: number) => Number.isFinite(value) && value > 0);
+    if (!prices.length) return null;
+    return { min: Math.min(...prices), max: Math.max(...prices) };
+}
+
+function scoreStoreForUser(store: any, user?: IUser): { recommendation_score: number; match_reasons: string[] } {
+    const prefs = (user?.preferences ?? {}) as Record<string, unknown>;
+    const goal = String(prefs.goal ?? "");
+    const dietaryPreference = String(prefs.dietary_preference ?? "");
+    const allergies = Array.isArray(prefs.allergies) ? prefs.allergies.map((v) => String(v).toLowerCase()) : [];
+    const cuisines = Array.isArray(prefs.cuisine_preferences) ? prefs.cuisine_preferences.map((v) => String(v).toLowerCase()) : [];
+    const goals = (user?.daily_nutrition_goals ?? {}) as Record<string, unknown>;
+    const calorieGoal = Number(goals.calories ?? 0);
+
+    const haystack = normalizeText([
+        store.name,
+        store.description,
+        store.category,
+        ...(store.menu_items ?? []).map((item: any) => `${item.name_vi ?? ""} ${item.name_en ?? ""} ${item.description ?? ""}`),
+    ].filter(Boolean).join(" "));
+
+    let score = 0;
+    const reasons: string[] = [];
+
+    const addReason = (reason: string, amount: number) => {
+        score += amount;
+        if (!reasons.includes(reason)) reasons.push(reason);
+    };
+
+    if (store.is_verified) addReason("Da xac minh dinh duong", 1);
+    if (store.subscription_tier === "pro") addReason("Menu duoc cap nhat day du hon", 1);
+
+    const lightKeywords = ["salad", "healthy", "eat clean", "rau", "uc ga", "grill", "granola", "smoothie bowl"];
+    const proteinKeywords = ["protein", "bo", "ga", "ca hoi", "steak", "trung", "sua chua greek", "uc ga"];
+    const veganKeywords = ["vegan", "chay", "plant-based", "thuần chay"];
+    const ketoKeywords = ["keto", "low carb", "it duong", "it tinh bot"];
+
+    if (goal === "weight_loss" || calorieGoal > 0 && calorieGoal <= 1800) {
+        if (lightKeywords.some((kw) => haystack.includes(kw))) addReason("Hop muc tieu giam can", 4);
+    }
+
+    if (goal === "muscle_gain" || calorieGoal > 2200) {
+        if (proteinKeywords.some((kw) => haystack.includes(kw))) addReason("Co mon giau protein", 4);
+    }
+
+    if (dietaryPreference) {
+        if (dietaryPreference.includes("vegan") || dietaryPreference.includes("vegetarian")) {
+            if (veganKeywords.some((kw) => haystack.includes(kw))) addReason("Phu hop che do an chay", 4);
+        }
+        if (dietaryPreference.includes("keto") || dietaryPreference.includes("low_carb")) {
+            if (ketoKeywords.some((kw) => haystack.includes(kw))) addReason("Co lua chon it carb", 3);
+        }
+    }
+
+    for (const cuisine of cuisines) {
+        if (cuisine && haystack.includes(cuisine)) {
+            addReason(`Co mon hop so thich ${cuisine}`, 2);
+            break;
+        }
+    }
+
+    const allergenKeywords: Record<string, string[]> = {
+        milk: ["milk", "cheese", "sua"],
+        dairy: ["milk", "cheese", "sua"],
+        egg: ["egg", "trung"],
+        peanut: ["peanut", "lac", "dau phong"],
+        nuts: ["hat", "almond", "cashew", "walnut"],
+        shellfish: ["tom", "cua", "shellfish"],
+        seafood: ["hai san", "tom", "ca", "muc"],
+        soy: ["soy", "dau nanh", "tofu", "tau hu"],
+        gluten: ["mi", "bread", "banh mi", "pasta"],
+    };
+
+    const allergenMentioned = allergies.some((allergy) =>
+        (allergenKeywords[allergy] ?? []).some((kw) => haystack.includes(kw)),
+    );
+    if (!allergenMentioned && allergies.length > 0) addReason("It dau hieu xung dot voi di ung da khai bao", 2);
+
+    return { recommendation_score: score, match_reasons: reasons.slice(0, 3) };
+}
+
+function decorateStore(store: any, user?: IUser, distance_km?: number) {
+    const plain = typeof store.toObject === "function" ? store.toObject() : store;
+    const { recommendation_score, match_reasons } = scoreStoreForUser(plain, user);
+    return {
+        ...plain,
+        recommendation_score,
+        match_reasons,
+        price_range: getPriceRange(plain),
+        ...(distance_km !== undefined ? { distance_km: Number(distance_km.toFixed(2)) } : {}),
+    };
+}
+
 // ── GET /api/stores — public list ─────────────────────────────────────────────
 
-router.get("/", async (req: Request, res: Response) => {
+router.get("/", optionalAuthenticate, async (req: Request, res: Response) => {
     try {
         const { q, category, city, limit = 50, offset = 0 } = req.query;
         const filter: Record<string, unknown> = { is_active: true };
@@ -44,13 +154,53 @@ router.get("/", async (req: Request, res: Response) => {
         if (city) filter.city = { $regex: city as string, $options: "i" };
 
         const stores = await Store.find(filter)
-            .select("-menu_items")
             .sort({ subscription_tier: -1, views_count: -1 })
             .limit(Number(limit))
             .skip(Number(offset));
 
         const total = await Store.countDocuments(filter);
-        res.json({ data: stores, total });
+        const decorated = stores
+            .map((store) => decorateStore(store, req.user as IUser | undefined))
+            .sort((a, b) =>
+                (b.recommendation_score - a.recommendation_score)
+                || ((b.subscription_tier === "pro" ? 1 : 0) - (a.subscription_tier === "pro" ? 1 : 0))
+                || ((b.views_count ?? 0) - (a.views_count ?? 0)),
+            );
+        res.json({ data: decorated, total });
+    } catch (error) {
+        res.status(500).json({ error: (error as Error).message });
+    }
+});
+
+// ── GET /api/stores/nearby — public nearby list with optional personalization ──
+
+router.get("/nearby", optionalAuthenticate, async (req: Request, res: Response) => {
+    try {
+        const lat = Number(req.query.lat);
+        const lng = Number(req.query.lng);
+        const radiusKm = Math.min(Number(req.query.radius ?? 5), 30);
+
+        if (!Number.isFinite(lat) || !Number.isFinite(lng)) {
+            res.status(400).json({ error: "lat and lng are required" });
+            return;
+        }
+
+        const stores = await Store.find({ is_active: true });
+        const nearby = stores
+            .filter((store: any) => store.location?.lat != null && store.location?.lng != null)
+            .map((store: any) => ({
+                store,
+                distance_km: haversineKm(lat, lng, store.location.lat, store.location.lng),
+            }))
+            .filter((entry) => entry.distance_km <= radiusKm)
+            .map((entry) => decorateStore(entry.store, req.user as IUser | undefined, entry.distance_km))
+            .sort((a, b) =>
+                (b.recommendation_score - a.recommendation_score)
+                || ((a.distance_km ?? 999) - (b.distance_km ?? 999))
+                || ((b.subscription_tier === "pro" ? 1 : 0) - (a.subscription_tier === "pro" ? 1 : 0)),
+            );
+
+        res.json(nearby);
     } catch (error) {
         res.status(500).json({ error: (error as Error).message });
     }

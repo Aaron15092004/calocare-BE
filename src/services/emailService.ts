@@ -17,7 +17,7 @@ function getTransporter(): Transporter {
     return _transporter;
 }
 
-const FROM = () => process.env.EMAIL_FROM || `"CaloCare" <${process.env.SMTP_USER}>`;
+const FROM = () => process.env.EMAIL_FROM || `"CaloVie" <${process.env.SMTP_USER}>`;
 
 // ── Shared layout wrapper ─────────────────────────────────────────────────────
 
@@ -52,14 +52,14 @@ function layout(title: string, body: string): string {
 <body>
   <div class="wrap">
     <div class="header">
-      <h1>🥗 CaloCare</h1>
+      <h1>🥗 CaloVie</h1>
       <p>Dinh dưỡng thông minh — sống khoẻ mỗi ngày</p>
     </div>
     <div class="body">${body}</div>
     <div class="footer">
-      Bạn nhận được email này vì có tài khoản CaloCare.<br/>
-      <a href="${process.env.FRONTEND_URL || "https://calocare.app"}">Truy cập CaloCare</a> &nbsp;·&nbsp;
-      <a href="${process.env.FRONTEND_URL || "https://calocare.app"}/settings">Cài đặt tài khoản</a>
+      Bạn nhận được email này vì có tài khoản CaloVie.<br/>
+      <a href="${process.env.FRONTEND_URL || "https://CaloVie.app"}">Truy cập CaloVie</a> &nbsp;·&nbsp;
+      <a href="${process.env.FRONTEND_URL || "https://CaloVie.app"}/settings">Cài đặt tài khoản</a>
     </div>
   </div>
 </body>
@@ -75,9 +75,9 @@ export async function sendRenewalReminder(opts: {
     expiresAt: Date;
 }): Promise<void> {
     const { to, name, tier, expiresAt } = opts;
-    const tierLabel = tier === "pro" ? "Pro" : "Premium";
+    const tierLabel = tier === "pro" || tier === "family" ? "Family" : "Premium";
     const expiryStr = expiresAt.toLocaleDateString("vi-VN", { day: "2-digit", month: "2-digit", year: "numeric" });
-    const frontendUrl = process.env.FRONTEND_URL || "https://calocare.app";
+    const frontendUrl = process.env.FRONTEND_URL || "https://CaloVie.app";
 
     const body = `
       <h2>Nhắc nhở gia hạn gói ${tierLabel} 🔔</h2>
@@ -112,9 +112,9 @@ export async function sendRenewalReminderUrgent(opts: {
     expiresAt: Date;
 }): Promise<void> {
     const { to, name, tier, expiresAt } = opts;
-    const tierLabel = tier === "pro" ? "Pro" : "Premium";
+    const tierLabel = tier === "pro" || tier === "family" ? "Family" : "Premium";
     const expiryStr = expiresAt.toLocaleDateString("vi-VN", { day: "2-digit", month: "2-digit", year: "numeric" });
-    const frontendUrl = process.env.FRONTEND_URL || "https://calocare.app";
+    const frontendUrl = process.env.FRONTEND_URL || "https://CaloVie.app";
 
     const body = `
       <h2>🚨 Chỉ còn 3 ngày — Gói ${tierLabel} sắp hết hạn!</h2>
@@ -147,8 +147,8 @@ export async function sendSubscriptionExpired(opts: {
     tier: string;
 }): Promise<void> {
     const { to, name, tier } = opts;
-    const tierLabel = tier === "pro" ? "Pro" : "Premium";
-    const frontendUrl = process.env.FRONTEND_URL || "https://calocare.app";
+    const tierLabel = tier === "pro" || tier === "family" ? "Family" : "Premium";
+    const frontendUrl = process.env.FRONTEND_URL || "https://CaloVie.app";
 
     const body = `
       <h2>Gói ${tierLabel} của bạn đã hết hạn</h2>
@@ -188,14 +188,14 @@ export async function sendPaymentConfirmed(opts: {
     expiresAt: Date;
 }): Promise<void> {
     const { to, name, tier, durationMonths, amount, expiresAt } = opts;
-    const tierLabel = tier === "pro" ? "Pro" : "Premium";
+    const tierLabel = tier === "pro" || tier === "family" ? "Family" : "Premium";
     const expiryStr = expiresAt.toLocaleDateString("vi-VN", { day: "2-digit", month: "2-digit", year: "numeric" });
     const amountStr = amount.toLocaleString("vi-VN") + "₫";
 
     const body = `
       <h2>Thanh toán thành công! 🎉</h2>
       <p>Xin chào <strong>${name}</strong>,</p>
-      <p>Gói <strong>${tierLabel}</strong> của bạn đã được kích hoạt thành công. Cảm ơn bạn đã tin tưởng CaloCare!</p>
+      <p>Gói <strong>${tierLabel}</strong> của bạn đã được kích hoạt thành công. Cảm ơn bạn đã tin tưởng CaloVie!</p>
       <div class="info-box">
         <div class="row"><span class="label">Gói đăng ký</span><span>${tierLabel}</span></div>
         <div class="row"><span class="label">Thời hạn</span><span>${durationMonths} tháng</span></div>
@@ -203,7 +203,7 @@ export async function sendPaymentConfirmed(opts: {
         <div class="row"><span class="label">Hạn đến ngày</span><span><strong>${expiryStr}</strong></span></div>
       </div>
       <p>Bạn có thể bắt đầu sử dụng toàn bộ tính năng ngay bây giờ. Chúc bạn có hành trình dinh dưỡng thật tuyệt vời! 🥗</p>
-      <a href="${process.env.FRONTEND_URL || "https://calocare.app"}" class="btn">Khám phá ngay →</a>
+      <a href="${process.env.FRONTEND_URL || "https://CaloVie.app"}" class="btn">Khám phá ngay →</a>
     `;
 
     await getTransporter().sendMail({

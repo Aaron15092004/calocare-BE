@@ -114,7 +114,7 @@ const TOOLS = [
     },
     {
         name: "navigate_to_page",
-        description: "Navigate the user to a specific page in the CaloCare app. Use this when the user asks to go somewhere or wants to access a specific feature.",
+        description: "Navigate the user to a specific page in the CaloVie app. Use this when the user asks to go somewhere or wants to access a specific feature.",
         parameters: {
             type: "object",
             properties: {
@@ -147,7 +147,7 @@ const TOOLS = [
     },
     {
         name: "search_app_content",
-        description: "Search for food or recipe information in the CaloCare database and display results inline in the chat. Use when the user wants to find or browse specific foods or recipes.",
+        description: "Search for food or recipe information in the CaloVie database and display results inline in the chat. Use when the user wants to find or browse specific foods or recipes.",
         parameters: {
             type: "object",
             properties: {
@@ -339,7 +339,7 @@ export class ChatbotService {
             today.setHours(0, 0, 0, 0);
             const entries = await FoodDiary.find({
                 user_id: new Types.ObjectId(userId),
-                created_at: { $gte: today },
+                scanned_at: { $gte: today },
             }).lean();
 
             const totals = entries.reduce(
@@ -536,7 +536,7 @@ export class ChatbotService {
         _session?: Awaited<ReturnType<typeof this._getOrCreateSession>>,
     ): Promise<string> {
         const base =
-            "Bạn là CaloCare AI — trợ lý dinh dưỡng thông minh, được đào tạo theo hướng dẫn của Bộ Y tế Việt Nam và WHO. " +
+            "Bạn là CaloVie AI — trợ lý dinh dưỡng thông minh, được đào tạo theo hướng dẫn của Bộ Y tế Việt Nam và WHO. " +
             "Trả lời bằng tiếng Việt, ngắn gọn, thiết thực.\n" +
             "QUY TẮC BẮT BUỘC:\n" +
             "1. Khi cần số liệu dinh dưỡng cụ thể (calo, protein, carbs, fat của món ăn), " +
@@ -588,7 +588,7 @@ export class ChatbotService {
                 const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
                 const diaries = await FoodDiary.find({
                     user_id: user._id,
-                    created_at: { $gte: sevenDaysAgo },
+                    scanned_at: { $gte: sevenDaysAgo },
                 }).lean();
 
                 const avgCalories = diaries.length

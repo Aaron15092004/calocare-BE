@@ -1,6 +1,6 @@
 import mongoose, { Schema, Document, Types } from "mongoose";
 
-export type PlanType = "premium" | "pro" | "store_pro";
+export type PlanType = "premium" | "family" | "pro" | "store_pro";
 
 export interface IPaymentTransaction extends Document {
     user_id: Types.ObjectId;
@@ -25,7 +25,7 @@ const PaymentTransactionSchema = new Schema<IPaymentTransaction>(
         user_id: { type: Schema.Types.ObjectId, ref: "User", required: true, index: true },
         plan_type: {
             type: String,
-            enum: ["premium", "pro", "store_pro"],
+            enum: ["premium", "family", "pro", "store_pro"],
             required: true,
         },
         target_type: { type: String, enum: ["user", "store"], default: "user" },

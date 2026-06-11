@@ -1,10 +1,71 @@
 import { Router, Request, Response } from "express";
+import { z } from "zod";
 import { authenticate } from "../middleware/auth";
 import FoodDiary from "../models/FoodDiary";
 import { IUser } from "../models/User";
 import { getFatSecretImportService, FatSecretImportService } from "../services/rag/FatSecretImportService";
 
 const router = Router();
+
+const NutritionSchema = z.object({
+    calories: z.number().finite().min(0).max(10000),
+    protein: z.number().finite().min(0).max(1000),
+    carbs: z.number().finite().min(0).max(1000),
+    fat: z.number().finite().min(0).max(1000),
+    fiber: z.number().finite().min(0).max(1000).optional().default(0),
+});
+
+const FoodItemSchema = z.object({
+    dish_name: z.string().min(1).max(200),
+    source: z.enum(["recipe", "food", "ai_estimate", "usda", "fatsecret"]),
+    matched_name: z.string().max(200).optional(),
+    nutrition: NutritionSchema,
+    weight_grams: z.number().finite().min(0).max(5000).optional(),
+    servings: z.number().finite().min(0).max(100).optional(),
+    recipe_id: z.string().optional(),
+    food_id: z.string().optional(),
+    usda_fdc_id: z.number().int().positive().optional(),
+});
+
+const CreateDiarySchema = z.object({
+    foods: z.array(FoodItemSchema).min(1).max(20),
+    totals: NutritionSchema,
+    mealType: z.enum(["breakfast", "lunch", "dinner", "snack"]).optional(),
+    meal_type: z.enum(["breakfast", "lunch", "dinner", "snack"]).optional(),
+    healthScore: z.number().finite().min(0).max(100).optional(),
+    health_score: z.number().finite().min(0).max(100).optional(),
+    vitamins: z.unknown().optional(),
+    healthTips: z.unknown().optional(),
+    health_tips: z.unknown().optional(),
+    imageUrl: z.string().url().optional().or(z.literal("").transform(() => undefined)),
+    image_url: z.string().url().optional().or(z.literal("").transform(() => undefined)),
+    notes: z.string().max(1000).optional(),
+});
+
+const ScanResultSchema = z.object({
+    name: z.string().min(1).max(200),
+    source_type: z.enum(["recipe", "food", "ai_estimate", "usda"]).optional(),
+    source_id: z.string().optional(),
+    calories: z.number().finite().min(0).max(10000).optional(),
+    protein: z.number().finite().min(0).max(1000).optional(),
+    carbs: z.number().finite().min(0).max(1000).optional(),
+    fat: z.number().finite().min(0).max(1000).optional(),
+    serving_size: z.number().finite().min(1).max(5000).optional(),
+    per_100g: z.object({
+        calories: z.number().finite().min(0).max(3000),
+        protein: z.number().finite().min(0).max(1000),
+        carbs: z.number().finite().min(0).max(1000),
+        fat: z.number().finite().min(0).max(1000),
+    }).optional(),
+});
+
+const SaveAiScanSchema = z.object({
+    scan_result: ScanResultSchema,
+    meal_type: z.enum(["breakfast", "lunch", "dinner", "snack"]).optional(),
+    quantity: z.number().finite().min(1).max(20).optional(),
+    weight_grams: z.number().finite().min(1).max(5000).optional(),
+    date: z.string().datetime().optional(),
+});
 
 // GET /api/food-diary
 router.get("/", authenticate, async (req: Request, res: Response) => {
@@ -53,17 +114,34 @@ router.get("/", authenticate, async (req: Request, res: Response) => {
 router.post("/", authenticate, async (req: Request, res: Response) => {
     try {
         const user = req.user as IUser;
+        const parsed = CreateDiarySchema.safeParse(req.body);
+        if (!parsed.success) {
+            res.status(400).json({ error: "Invalid diary payload", details: parsed.error.flatten() });
+            return;
+        }
+
+        const payload = parsed.data;
         // Strip fs_food_id (not in schema) before creating
-        const foods = ((req.body.foods ?? []) as Record<string, unknown>[]).map(
+        const foods = (payload.foods as unknown as Record<string, unknown>[]).map(
             ({ fs_food_id: _, ...rest }) => rest,
         );
-        const entry = await FoodDiary.create({ ...req.body, foods, user_id: user._id });
+        const entry = await FoodDiary.create({
+            foods,
+            totals: payload.totals,
+            meal_type: payload.meal_type ?? payload.mealType ?? "lunch",
+            health_score: payload.health_score ?? payload.healthScore,
+            vitamins: payload.vitamins,
+            health_tips: payload.health_tips ?? payload.healthTips,
+            image_url: payload.image_url ?? payload.imageUrl,
+            notes: payload.notes,
+            user_id: user._id,
+        });
         res.status(201).json(entry);
 
         // Enrich any FatSecret foods into local DB (background, after response sent)
         if (FatSecretImportService.isAvailable()) {
-            const foods = (req.body.foods ?? []) as { source?: string; fs_food_id?: string; dish_name?: string }[];
-            for (const food of foods) {
+            const originalFoods = (req.body.foods ?? []) as { source?: string; fs_food_id?: string; dish_name?: string }[];
+            for (const food of originalFoods) {
                 if (food.source === "fatsecret" && food.fs_food_id) {
                     getFatSecretImportService()
                         .upsertFullFoodWithViName(food.fs_food_id, food.dish_name ?? "")
@@ -80,21 +158,21 @@ router.post("/", authenticate, async (req: Request, res: Response) => {
 router.post("/ai-scan", authenticate, async (req: Request, res: Response) => {
     try {
         const user = req.user as IUser;
-        const { scan_result, meal_type, quantity = 1, weight_grams, date } = req.body;
-
-        if (!scan_result) {
-            res.status(400).json({ error: "scan_result is required" });
+        const parsed = SaveAiScanSchema.safeParse(req.body);
+        if (!parsed.success) {
+            res.status(400).json({ error: "Invalid ai-scan payload", details: parsed.error.flatten() });
             return;
         }
+        const { scan_result, meal_type, quantity = 1, weight_grams, date } = parsed.data;
 
         // Recalculate nutrition if user adjusted the gram weight
-        let calories = scan_result.calories as number;
-        let protein  = scan_result.protein  as number;
-        let carbs    = scan_result.carbs    as number;
-        let fat      = scan_result.fat      as number;
+        let calories = scan_result.calories ?? 0;
+        let protein  = scan_result.protein  ?? 0;
+        let carbs    = scan_result.carbs    ?? 0;
+        let fat      = scan_result.fat      ?? 0;
 
         if (weight_grams && scan_result.per_100g) {
-            const f = (weight_grams as number) / 100;
+            const f = weight_grams / 100;
             calories = scan_result.per_100g.calories * f;
             protein  = scan_result.per_100g.protein  * f;
             carbs    = scan_result.per_100g.carbs    * f;
@@ -115,7 +193,7 @@ router.post("/ai-scan", authenticate, async (req: Request, res: Response) => {
             source,
             matched_name: scan_result.name,
             nutrition: { calories: totCal, protein: totProt, carbs: totCarb, fat: totFat, fiber: 0 },
-            weight_grams: weight_grams ?? (scan_result.serving_size * qty),
+            weight_grams: weight_grams ?? ((scan_result.serving_size ?? 100) * qty),
             servings:     qty,
         };
         if (source === "food"   && scan_result.source_id) foodItem.food_id   = scan_result.source_id;
@@ -123,7 +201,7 @@ router.post("/ai-scan", authenticate, async (req: Request, res: Response) => {
 
         const entry = await FoodDiary.create({
             user_id:    user._id,
-            scanned_at: date ? new Date(date as string) : new Date(),
+            scanned_at: date ? new Date(date) : new Date(),
             foods:      [foodItem],
             totals:     { calories: totCal, protein: totProt, carbs: totCarb, fat: totFat, fiber: 0 },
             meal_type:  meal_type ?? "lunch",
