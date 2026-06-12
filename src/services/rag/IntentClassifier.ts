@@ -69,11 +69,10 @@ export class IntentClassifier {
         const regexResult = this.classify(message);
         if (regexResult !== "faq") return regexResult;
 
-        // Skip LLM for very short messages (≤ 6 words) — too little context for
-        // the LLM to improve over regex; default to "faq" which triggers the
-        // lightweight non-diary system prompt path.
+        // Skip LLM for short-to-medium messages — the extra model hop adds
+        // noticeable latency and often does not improve intent quality.
         const wordCount = message.trim().split(/\s+/).length;
-        if (wordCount <= 6) return "faq";
+        if (wordCount <= 12) return "faq";
 
         // LLM fallback only for longer ambiguous messages where context matters
         try {
