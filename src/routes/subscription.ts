@@ -304,7 +304,7 @@ router.post("/upgrade", authenticate, async (req: Request, res: Response) => {
             finalAmount = Math.round(finalAmount * (1 - globalPct / 100));
         }
 
-        // Then apply user's discount code on top
+        // Then apply user's discount code on top of the already-discounted total
         if (discount_code) {
             const code = await DiscountCode.findOne({
                 code: discount_code.toUpperCase(),
@@ -313,9 +313,9 @@ router.post("/upgrade", authenticate, async (req: Request, res: Response) => {
             });
             if (code) {
                 if (code.discount_type === "percentage") {
-                    finalAmount = Math.round(baseAmount * (1 - code.discount_value / 100));
+                    finalAmount = Math.round(finalAmount * (1 - code.discount_value / 100));
                 } else {
-                    finalAmount = Math.max(0, baseAmount - code.discount_value);
+                    finalAmount = Math.max(0, finalAmount - code.discount_value);
                 }
                 await DiscountCode.findByIdAndUpdate(code._id, { $inc: { used_count: 1 } });
             }
