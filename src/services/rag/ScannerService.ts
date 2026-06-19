@@ -49,8 +49,8 @@ export interface ScanFoodResult {
 }
 
 const HIGH_CONFIDENCE_THRESHOLD = 0.75;
-const VISION_TIMEOUT_MS = Number(process.env.SCAN_VISION_TIMEOUT_MS ?? 15_000);
-const EMBEDDING_TIMEOUT_MS = Number(process.env.SCAN_EMBEDDING_TIMEOUT_MS ?? 8_000);
+const VISION_TIMEOUT_MS = Number(process.env.SCAN_VISION_TIMEOUT_MS ?? 45_000);
+const EMBEDDING_TIMEOUT_MS = Number(process.env.SCAN_EMBEDDING_TIMEOUT_MS ?? 12_000);
 const VECTOR_TIMEOUT_MS = Number(process.env.SCAN_VECTOR_TIMEOUT_MS ?? 2_000);
 const HYDRATE_TIMEOUT_MS = Number(process.env.SCAN_HYDRATE_TIMEOUT_MS ?? 1_500);
 
