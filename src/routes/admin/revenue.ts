@@ -1,6 +1,9 @@
 import { Router, Request, Response } from "express";
 import { authenticate } from "../../middleware/auth";
 import { requireAdmin } from "../../middleware/roleCheck";
+import ApiUsage from "../../models/ApiUsage";
+import ChatSession from "../../models/ChatSession";
+import MealPlan from "../../models/MealPlan";
 import PaymentTransaction from "../../models/PaymentTransaction";
 import { getPayOS, isPayOSConfigured } from "../../services/payosClient";
 
@@ -9,6 +12,11 @@ const router = Router();
 const MAX_RANGE_DAYS = 370;
 const DEFAULT_RANGE_DAYS = 30;
 const VND_AMOUNT_EXPR = { $ifNull: ["$final_amount", "$amount"] };
+const COST_PER_CHAT_MSG = 0.004;
+const COST_PER_MEAL_PLAN_7D = 0.020;
+const COST_PER_SCAN = 0.0002;
+const COST_PER_EMBED = 0.000001;
+const USD_TO_VND = Number(process.env.AI_COST_USD_TO_VND || 26000);
 
 function startOfDay(date: Date): Date {
     return new Date(date.getFullYear(), date.getMonth(), date.getDate());
@@ -55,6 +63,10 @@ function formatDateKey(date: Date): string {
     return date.toISOString().slice(0, 10);
 }
 
+function formatHourKey(date: Date): string {
+    return date.toISOString().slice(0, 13);
+}
+
 function buildDailySeries(start: Date, end: Date, rows: Array<{ _id: string; revenue: number; count: number }>) {
     const map = new Map(rows.map((row) => [row._id, row]));
     const result: Array<{ date: string; revenue: number; count: number }> = [];
@@ -95,6 +107,9 @@ router.get("/", authenticate, requireAdmin, async (req: Request, res: Response) 
             todayRows,
             monthRows,
             previousRows,
+            chatUsageRows,
+            mealPlanUsageRows,
+            apiUsageRows,
         ] = await Promise.all([
             PaymentTransaction.aggregate([
                 { $match: rangeMatch },
@@ -194,6 +209,34 @@ router.get("/", authenticate, requireAdmin, async (req: Request, res: Response) 
                 { $match: { status: "completed", created_at: { $gte: previousStart, $lte: previousEnd } } },
                 { $group: { _id: null, revenue: { $sum: VND_AMOUNT_EXPR }, count: { $sum: 1 } } },
             ]),
+            ChatSession.aggregate([
+                { $unwind: "$messages" },
+                {
+                    $match: {
+                        "messages.role": "user",
+                        "messages.timestamp": { $gte: start, $lte: end },
+                    },
+                },
+                { $group: { _id: null, count: { $sum: 1 } } },
+            ]),
+            MealPlan.aggregate([
+                {
+                    $match: {
+                        created_at: { $gte: start, $lte: end },
+                        creator_id: { $exists: true, $ne: null },
+                    },
+                },
+                { $group: { _id: null, count: { $sum: 1 }, total_days: { $sum: "$total_days" } } },
+            ]),
+            ApiUsage.aggregate([
+                {
+                    $match: {
+                        service: { $in: ["gemini", "voyage"] },
+                        hour: { $gte: formatHourKey(start), $lte: formatHourKey(end) },
+                    },
+                },
+                { $group: { _id: "$service", count: { $sum: "$count" } } },
+            ]),
         ]);
 
         const statusMap = new Map(statusRows.map((row) => [row._id || "unknown", row]));
@@ -208,6 +251,22 @@ router.get("/", authenticate, requireAdmin, async (req: Request, res: Response) 
             : null;
 
         const webhookBaseUrl = getWebhookBaseUrl();
+        const apiUsageMap = new Map(apiUsageRows.map((row: any) => [row._id, row.count]));
+        const chatMessages = chatUsageRows[0]?.count || 0;
+        const mealPlanCount = mealPlanUsageRows[0]?.count || 0;
+        const mealPlanTotalDays = mealPlanUsageRows[0]?.total_days || 0;
+        const scanCalls = apiUsageMap.get("gemini") || 0;
+        const embedCalls = apiUsageMap.get("voyage") || 0;
+        const costChatUsd = +(chatMessages * COST_PER_CHAT_MSG).toFixed(4);
+        const costMealPlansUsd = +((mealPlanTotalDays / 7) * COST_PER_MEAL_PLAN_7D).toFixed(4);
+        const costScansUsd = +(scanCalls * COST_PER_SCAN).toFixed(4);
+        const costEmbedsUsd = +(embedCalls * COST_PER_EMBED).toFixed(4);
+        const totalAiCostUsd = +(costChatUsd + costMealPlansUsd + costScansUsd + costEmbedsUsd).toFixed(4);
+        const totalAiCostVnd = Math.round(totalAiCostUsd * USD_TO_VND);
+        const netProfitEstimate = completedRevenue - totalAiCostVnd;
+        const grossMarginPct = completedRevenue > 0
+            ? Math.round((netProfitEstimate / completedRevenue) * 1000) / 10
+            : null;
 
         res.json({
             range: {
@@ -217,6 +276,10 @@ router.get("/", authenticate, requireAdmin, async (req: Request, res: Response) 
             },
             totals: {
                 completed_revenue: completedRevenue,
+                estimated_ai_cost_vnd: totalAiCostVnd,
+                estimated_ai_cost_usd: totalAiCostUsd,
+                estimated_net_profit_vnd: netProfitEstimate,
+                gross_margin_pct: grossMarginPct,
                 completed_count: completed?.count || 0,
                 pending_amount: pending?.amount || 0,
                 pending_count: pending?.count || 0,
@@ -249,6 +312,25 @@ router.get("/", authenticate, requireAdmin, async (req: Request, res: Response) 
                     revenue: row.revenue || 0,
                     count: row.count || 0,
                 })),
+                ai_cost_by_service: [
+                    { service: "chat", label: "Chat AI", usage_count: chatMessages, cost_usd: costChatUsd, cost_vnd: Math.round(costChatUsd * USD_TO_VND) },
+                    { service: "meal_plan", label: "Meal plan AI", usage_count: mealPlanCount, total_days: mealPlanTotalDays, cost_usd: costMealPlansUsd, cost_vnd: Math.round(costMealPlansUsd * USD_TO_VND) },
+                    { service: "scan", label: "Scan AI", usage_count: scanCalls, cost_usd: costScansUsd, cost_vnd: Math.round(costScansUsd * USD_TO_VND) },
+                    { service: "embed", label: "Embedding/search", usage_count: embedCalls, cost_usd: costEmbedsUsd, cost_vnd: Math.round(costEmbedsUsd * USD_TO_VND) },
+                ],
+            },
+            accounting: {
+                currency: "VND",
+                usd_to_vnd: USD_TO_VND,
+                revenue_vnd: completedRevenue,
+                direct_ai_cost_vnd: totalAiCostVnd,
+                estimated_net_profit_vnd: netProfitEstimate,
+                gross_margin_pct: grossMarginPct,
+                formulas: {
+                    revenue: "Tổng final_amount/amount của giao dịch completed trong kỳ",
+                    ai_cost: "Chat + Meal plan + Scan + Embedding, quy đổi theo AI_COST_USD_TO_VND",
+                    net_profit: "Doanh thu completed - chi phí AI trực tiếp",
+                },
             },
             automation: {
                 payos_configured: isPayOSConfigured(),

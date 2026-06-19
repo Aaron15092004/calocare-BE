@@ -43,10 +43,16 @@ export const configurePassport = (): void => {
 
                     if (user) {
                         // Update google_id if missing
+                        let changed = false;
                         if (!user.google_id) {
                             user.google_id = profile.id;
-                            await user.save();
+                            changed = true;
                         }
+                        if (!user.avatar_url && profile.photos?.[0]?.value) {
+                            user.avatar_url = profile.photos[0].value;
+                            changed = true;
+                        }
+                        if (changed) await user.save();
                     } else {
                         user = await User.create({
                             email,

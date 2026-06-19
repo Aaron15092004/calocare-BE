@@ -10,6 +10,10 @@ const router = Router();
 
 const ChatRequestSchema = z.object({
     message: z.string().min(1).max(2000),
+    location: z.object({
+        lat: z.number().min(-90).max(90),
+        lng: z.number().min(-180).max(180),
+    }).optional(),
 });
 
 // POST /api/rag/chat u2014 SSE streaming response
@@ -41,6 +45,7 @@ router.post("/", authenticate, ragRateLimit("chat"), async (req: Request, res: R
             parsed.data.message,
             (chunk) => sendEvent("chunk", { text: chunk }),
             (type, data) => sendEvent(type, data),
+            parsed.data.location,
         );
         logRag({ endpoint: "chat", userId, query: parsed.data.message.slice(0, 100), latency_ms: Date.now() - t0, status: "ok" });
         sendEvent("done", { ok: true });
