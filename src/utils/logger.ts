@@ -29,6 +29,12 @@ export interface RagLogEntry {
     result_count?: number;
     matched?: boolean;
     fallback_used?: boolean;
+    fallback_reason?: string;
+    timings_ms?: Record<string, number>;
+    image_bytes?: number;
+    mime_type?: string;
+    error_code?: string;
+    stage?: string;
     // meal-plan only: how many meals came from each real source vs AI
     source_breakdown?: { usda: number; recipe: number; food: number; ai_generated: number };
     status: "ok" | "error" | "rate_limited" | "not_food";

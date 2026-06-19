@@ -3,12 +3,13 @@ import { authenticate } from "../middleware/auth";
 import { requireAdmin } from "../middleware/roleCheck";
 import { IUser } from "../models/User";
 import User from "../models/User";
+import Store from "../models/Store";
 import PaymentTransaction, { IPaymentTransaction, PlanType } from "../models/PaymentTransaction";
 import DiscountCode from "../models/DiscountCode";
 import SystemSettings from "../models/SystemSettings";
-import { PayOS } from "@payos/node";
 import { sendPaymentConfirmed } from "../services/emailService";
 import { getEffectiveUserTier } from "../utils/subscriptionEntitlements";
+import { getClientUrl, getPayOS } from "../services/payosClient";
 
 // Returns the active global discount percentage (0 if none, expired, or plan not in applicable_plans)
 async function getGlobalDiscountPct(planType?: string): Promise<number> {
@@ -24,23 +25,6 @@ async function getGlobalDiscountPct(planType?: string): Promise<number> {
 }
 
 const router = Router();
-
-// ── PayOS singleton (lazy — only initialised when env vars are present) ───────
-
-let _payos: PayOS | null = null;
-
-function getPayOS(): PayOS {
-    if (!_payos) {
-        const clientId    = process.env.PAYOS_CLIENT_ID;
-        const apiKey      = process.env.PAYOS_API_KEY;
-        const checksumKey = process.env.PAYOS_CHECKSUM_KEY;
-        if (!clientId || !apiKey || !checksumKey) {
-            throw new Error("PayOS env vars not configured (PAYOS_CLIENT_ID / PAYOS_API_KEY / PAYOS_CHECKSUM_KEY)");
-        }
-        _payos = new PayOS({ clientId, apiKey, checksumKey });
-    }
-    return _payos;
-}
 
 // ── Plan config ────────────────────────────────────────────────────────────────
 
@@ -259,6 +243,36 @@ async function activateSubscription(
             console.warn(`[subscription] Discount code ${tx.discount_code} was paid but no usage slot was available.`);
         }
     }
+}
+
+async function activateStoreSubscription(
+    tx: IPaymentTransaction,
+    paymentRef?: string,
+): Promise<void> {
+    if (tx.status === "completed") return;
+    if (tx.status !== "pending") {
+        throw new PaymentValidationError("Giao dịch không còn ở trạng thái chờ thanh toán.", "transaction_not_pending");
+    }
+    if (tx.plan_type !== "store_pro" || tx.target_type !== "store") {
+        throw new PaymentValidationError("Giao dịch Store Pro không hợp lệ.", "invalid_store_transaction");
+    }
+
+    tx.status = "completed";
+    if (paymentRef) tx.payment_ref = paymentRef;
+    await tx.save();
+
+    const store = await Store.findById(tx.store_id);
+    if (!store) return;
+
+    const now = new Date();
+    const base = store.subscription_expires_at && store.subscription_expires_at > now
+        ? store.subscription_expires_at
+        : now;
+    const newExpiry = new Date(base);
+    newExpiry.setMonth(newExpiry.getMonth() + tx.duration_months);
+    store.subscription_tier = "pro";
+    store.subscription_expires_at = newExpiry;
+    await store.save();
 }
 
 // ── Helpers ──────────────────��─────────────────────────────────���──────────────
@@ -541,7 +555,7 @@ router.post("/upgrade", authenticate, async (req: Request, res: Response) => {
         // ── PayOS checkout link ──────────────────────────────────────────────
         if (paymentMethod === "payos") {
             const payos      = getPayOS();
-            const clientUrl  = process.env.CLIENT_URL || "http://localhost:2004";
+            const clientUrl  = getClientUrl();
             // orderCode: 32-bit unsigned int derived from last 8 hex chars of txId
             const orderCode  = parseInt(txId.slice(-8), 16);
             // description max 25 chars — ref is "CALOXXXXXXXX" (12 chars)
@@ -551,8 +565,8 @@ router.post("/upgrade", authenticate, async (req: Request, res: Response) => {
                 orderCode,
                 amount: quote.final_amount,
                 description,
-                returnUrl: `${clientUrl}/subscription/success?txId=${txId}`,
-                cancelUrl:  `${clientUrl}/subscription/cancel?txId=${txId}`,
+                returnUrl: `${clientUrl}/subscription/status?txId=${txId}`,
+                cancelUrl:  `${clientUrl}/subscription/status?txId=${txId}`,
                 items: [{
                     name:     `${quote.plan_name} ${quote.duration_months}th`,
                     quantity: 1,
@@ -573,6 +587,7 @@ router.post("/upgrade", authenticate, async (req: Request, res: Response) => {
                 payment_method: "payos",
                 checkout_url:  link.checkoutUrl,
                 qr_code:       link.qrCode,
+                payment_ref:   tx.payment_ref,
                 quote,
             });
         }
@@ -653,7 +668,7 @@ router.post("/webhook/bank", async (req: Request, res: Response) => {
 router.post("/webhook/payos", async (req: Request, res: Response) => {
     try {
         // Throws PayOS.InvalidSignatureError when signature is wrong
-        let webhookData: { code?: string; orderCode?: string | number; reference?: string };
+        let webhookData: { code?: string; orderCode?: string | number; reference?: string; amount?: number };
         try {
             webhookData = await getPayOS().webhooks.verify(req.body) as typeof webhookData;
         } catch {
@@ -669,7 +684,6 @@ router.post("/webhook/payos", async (req: Request, res: Response) => {
 
         const tx = await PaymentTransaction.findOne({
             payment_ref: String(webhookData.orderCode),
-            target_type: "user",
             status: "pending",
         });
 
@@ -679,7 +693,17 @@ router.post("/webhook/payos", async (req: Request, res: Response) => {
             return;
         }
 
-        await activateSubscription(tx, webhookData.reference);
+        const paidAmount = Number(webhookData.amount);
+        if (Number.isFinite(paidAmount) && paidAmount < tx.final_amount) {
+            res.status(400).json({ error: "Payment amount insufficient" });
+            return;
+        }
+
+        if (tx.target_type === "store") {
+            await activateStoreSubscription(tx, webhookData.reference);
+        } else {
+            await activateSubscription(tx, webhookData.reference);
+        }
 
         res.json({ message: "activated", transaction_id: tx._id });
     } catch (error) {
@@ -691,12 +715,8 @@ router.post("/webhook/payos", async (req: Request, res: Response) => {
 // PayOS appends ?code=00&... on success, other codes on cancel/failure.
 // Activation is handled by the webhook above — this only redirects the browser.
 router.get("/return/payos", (req: Request, res: Response) => {
-    const clientUrl = process.env.CLIENT_URL || "http://localhost:2004";
-    if (req.query.code === "00") {
-        res.redirect(`${clientUrl}/subscription/success?txId=${req.query.txId ?? ""}`);
-    } else {
-        res.redirect(`${clientUrl}/subscription/cancel?txId=${req.query.txId ?? ""}`);
-    }
+    const clientUrl = getClientUrl();
+    res.redirect(`${clientUrl}/subscription/status?txId=${req.query.txId ?? ""}`);
 });
 
 // POST /api/subscription/verify/:ref — admin or cron verifies a transaction by CALO ref

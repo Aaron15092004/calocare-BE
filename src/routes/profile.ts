@@ -5,6 +5,17 @@ import User, { IUser } from "../models/User";
 
 const router = Router();
 
+function isSafePreferenceKey(key: string): boolean {
+    return Boolean(key) &&
+        !key.includes(".") &&
+        !key.startsWith("$") &&
+        !["__proto__", "constructor", "prototype"].includes(key);
+}
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+    return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
 // GET /api/profile
 router.get("/", authenticate, (req: Request, res: Response) => {
     const user = req.user as IUser;
@@ -29,16 +40,32 @@ router.put("/", authenticate, async (req: Request, res: Response) => {
     try {
         const user = req.user as IUser;
         const { display_name, avatar_url, language, daily_nutrition_goals, preferences } = req.body;
+        const setOps: Record<string, unknown> = {
+            ...(display_name !== undefined && { display_name }),
+            ...(avatar_url !== undefined && { avatar_url }),
+            ...(language !== undefined && { language }),
+            ...(daily_nutrition_goals !== undefined && { daily_nutrition_goals }),
+        };
+
+        if (preferences !== undefined) {
+            if (!isPlainObject(preferences)) {
+                res.status(400).json({ error: "preferences must be an object" });
+                return;
+            }
+
+            for (const [key, value] of Object.entries(preferences)) {
+                if (value === undefined) continue;
+                if (!isSafePreferenceKey(key)) {
+                    res.status(400).json({ error: `Invalid preference key: ${key}` });
+                    return;
+                }
+                setOps[`preferences.${key}`] = value;
+            }
+        }
 
         const updated = await User.findByIdAndUpdate(
             user._id,
-            {
-                ...(display_name !== undefined && { display_name }),
-                ...(avatar_url !== undefined && { avatar_url }),
-                ...(language !== undefined && { language }),
-                ...(daily_nutrition_goals !== undefined && { daily_nutrition_goals }),
-                ...(preferences !== undefined && { preferences }),
-            },
+            { $set: setOps },
             { new: true, runValidators: true },
         );
 

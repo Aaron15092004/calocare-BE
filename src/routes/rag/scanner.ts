@@ -5,6 +5,7 @@ import { ragRateLimit } from "../../middleware/ragRateLimit";
 import { getScannerService, ScanMatch } from "../../services/rag/ScannerService";
 import { IUser } from "../../models/User";
 import { logRag } from "../../utils/logger";
+import { isOperationTimeoutError } from "../../utils/asyncTimeout";
 
 const router = Router();
 
@@ -64,6 +65,45 @@ function clampServingGrams(value?: number): number | undefined {
     return Math.round(Math.max(20, Math.min(1500, value as number)));
 }
 
+function classifyScanError(err: unknown): { status: number; error: string; message: string; retryable: boolean; stage?: string } {
+    const msg = err instanceof Error ? err.message : "Scan failed";
+
+    if (isOperationTimeoutError(err)) {
+        return {
+            status: 504,
+            error: "scan_timeout",
+            message: "Scan đang mất nhiều thời gian hơn bình thường. Bạn thử ảnh nhẹ hơn hoặc thử lại sau vài giây nhé.",
+            retryable: true,
+            stage: err.stage,
+        };
+    }
+
+    if (/invalid JSON|returned invalid JSON/i.test(msg)) {
+        return {
+            status: 502,
+            error: "scan_provider_bad_response",
+            message: "AI trả về dữ liệu chưa đúng định dạng. Bạn thử scan lại ảnh này nhé.",
+            retryable: true,
+        };
+    }
+
+    if (/429|rate limit|temporarily unavailable|deadline|ECONNABORTED|ETIMEDOUT|timeout|ENOTFOUND|ECONNRESET|service unavailable/i.test(msg)) {
+        return {
+            status: 503,
+            error: "scan_provider_unavailable",
+            message: "Dịch vụ AI đang bận hoặc phản hồi chậm. Bạn thử lại sau ít giây nhé.",
+            retryable: true,
+        };
+    }
+
+    return {
+        status: 500,
+        error: "scan_failed",
+        message: "Scan chưa hoàn tất. Bạn thử lại với ảnh rõ hơn nhé.",
+        retryable: true,
+    };
+}
+
 router.post("/", authenticate, ragRateLimit("scan"), upload.single("image"), async (req: Request, res: Response) => {
     if (!req.file) {
         res.status(400).json({ error: "No image file provided" });
@@ -79,6 +119,22 @@ router.post("/", authenticate, ragRateLimit("scan"), upload.single("image"), asy
     const imageBase64 = req.file.buffer.toString("base64");
     const mimeType = req.file.mimetype;
     const t0 = Date.now();
+    const imageBytes = req.file.size;
+    let clientAborted = false;
+
+    req.on("aborted", () => {
+        clientAborted = true;
+        logRag({
+            endpoint: "scan",
+            userId: user?._id?.toString(),
+            latency_ms: Date.now() - t0,
+            status: "error",
+            error: "client_aborted",
+            error_code: "client_aborted",
+            image_bytes: imageBytes,
+            mime_type: mimeType,
+        });
+    });
 
     try {
         const service = getScannerService();
@@ -87,6 +143,7 @@ router.post("/", authenticate, ragRateLimit("scan"), upload.single("image"), asy
             mimeType,
             userId: user?._id?.toString(),
         });
+        if (clientAborted || res.headersSent) return;
 
         if (result.vision.not_food) {
             logRag({
@@ -96,6 +153,9 @@ router.post("/", authenticate, ragRateLimit("scan"), upload.single("image"), asy
                 matched: false,
                 fallback_used: false,
                 status: "not_food",
+                timings_ms: result.timings_ms,
+                image_bytes: imageBytes,
+                mime_type: mimeType,
             });
             res.status(422).json({ error: "Ảnh này có vẻ không phải món ăn. Bạn thử chụp rõ phần đồ ăn hơn nhé." });
             return;
@@ -127,6 +187,10 @@ router.post("/", authenticate, ragRateLimit("scan"), upload.single("image"), asy
             latency_ms: Date.now() - t0,
             matched,
             fallback_used: result.fallback_used,
+            fallback_reason: result.fallback_reason,
+            timings_ms: result.timings_ms,
+            image_bytes: imageBytes,
+            mime_type: mimeType,
             status: "ok",
         });
 
@@ -137,14 +201,33 @@ router.post("/", authenticate, ragRateLimit("scan"), upload.single("image"), asy
             ai_estimate,
             confidence: result.primary_match?.confidence ?? result.vision.confidence,
             alternatives: result.alternatives.map(toClientMatch),
+            fallback_reason: result.fallback_reason,
             serving_grams:
                 clampServingGrams(result.primary_match?.estimated_portion_grams) ??
                 clampServingGrams(result.vision.estimated_portion_grams),
         });
     } catch (err) {
+        if (clientAborted || res.headersSent) return;
         const msg = err instanceof Error ? err.message : "Scan failed";
-        logRag({ endpoint: "scan", userId: user?._id?.toString(), latency_ms: Date.now() - t0, status: "error", error: msg });
-        res.status(500).json({ error: msg });
+        const classified = classifyScanError(err);
+        logRag({
+            endpoint: "scan",
+            userId: user?._id?.toString(),
+            latency_ms: Date.now() - t0,
+            status: "error",
+            error: msg,
+            error_code: classified.error,
+            stage: classified.stage,
+            image_bytes: imageBytes,
+            mime_type: mimeType,
+        });
+        res.status(classified.status).json({
+            error: classified.error,
+            message: classified.message,
+            retryable: classified.retryable,
+            stage: classified.stage,
+            detail: process.env.NODE_ENV === "production" ? undefined : msg,
+        });
     }
 });
 

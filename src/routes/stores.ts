@@ -6,6 +6,7 @@ import { IUser } from "../models/User";
 import Store from "../models/Store";
 import Review from "../models/Review";
 import PaymentTransaction from "../models/PaymentTransaction";
+import { getClientUrl, getPayOS } from "../services/payosClient";
 
 const router = Router();
 
@@ -152,9 +153,11 @@ function normalizeStoreProDuration(value: unknown): number {
     return months;
 }
 
-function normalizeStorePaymentMethod(value: unknown): "bank_transfer" | "momo" {
+type StorePaymentMethod = "bank_transfer" | "momo" | "payos";
+
+function normalizeStorePaymentMethod(value: unknown): StorePaymentMethod {
     const method = String(value || "bank_transfer");
-    if (method !== "bank_transfer" && method !== "momo") {
+    if (method !== "bank_transfer" && method !== "momo" && method !== "payos") {
         throw new Error("invalid_payment_method");
     }
     return method;
@@ -176,7 +179,7 @@ function buildStoreProQuote(durationMonths: number) {
     };
 }
 
-function getStorePaymentInstructions(method: "bank_transfer" | "momo", amount: number, ref: string) {
+function getStorePaymentInstructions(method: Exclude<StorePaymentMethod, "payos">, amount: number, ref: string) {
     const formatted = amount.toLocaleString("vi-VN");
     if (method === "momo") {
         const phone = process.env.PAYMENT_MOMO_PHONE || "0912345678";
@@ -765,6 +768,7 @@ router.post("/:id/upgrade", authenticate, async (req: Request, res: Response) =>
 
         if (existingPending) {
             const ref = `STORE${String(existingPending._id).slice(-8).toUpperCase()}`;
+            const existingMethod = (existingPending.payment_method || paymentMethod) as StorePaymentMethod;
             res.status(409).json({
                 error: "pending_transaction_exists",
                 message: "Quán đã có giao dịch Store Pro đang chờ thanh toán.",
@@ -773,12 +777,16 @@ router.post("/:id/upgrade", authenticate, async (req: Request, res: Response) =>
                 amount:         existingPending.amount,
                 final_amount:   existingPending.final_amount,
                 status:         existingPending.status,
-                payment_method: existingPending.payment_method || paymentMethod,
-                payment_instructions: getStorePaymentInstructions(
-                    (existingPending.payment_method as "bank_transfer" | "momo") || paymentMethod,
-                    existingPending.final_amount,
-                    ref,
-                ),
+                payment_method: existingMethod,
+                ...(existingMethod === "payos"
+                    ? { payment_ref: existingPending.payment_ref }
+                    : {
+                        payment_instructions: getStorePaymentInstructions(
+                            existingMethod,
+                            existingPending.final_amount,
+                            ref,
+                        ),
+                    }),
             });
             return;
         }
@@ -796,6 +804,42 @@ router.post("/:id/upgrade", authenticate, async (req: Request, res: Response) =>
         });
 
         const ref = `STORE${String(tx._id).slice(-8).toUpperCase()}`;
+
+        if (paymentMethod === "payos") {
+            const txId = String(tx._id);
+            const orderCode = parseInt(txId.slice(-8), 16);
+            const clientUrl = getClientUrl();
+            const link = await getPayOS().paymentRequests.create({
+                orderCode,
+                amount: quote.final_amount,
+                description: ref.slice(0, 25),
+                returnUrl: `${clientUrl}/owner/upgrade?txId=${txId}`,
+                cancelUrl: `${clientUrl}/owner/upgrade?txId=${txId}`,
+                items: [{
+                    name: `Store Pro ${durationMonths}th`,
+                    quantity: 1,
+                    price: quote.final_amount,
+                }],
+            });
+
+            tx.payment_ref = String(orderCode);
+            await tx.save();
+
+            res.status(201).json({
+                transaction_id: tx._id,
+                store_id:       store._id,
+                amount:         quote.amount,
+                final_amount:   quote.final_amount,
+                status:         "pending",
+                payment_method: "payos",
+                payment_ref:    tx.payment_ref,
+                checkout_url:   link.checkoutUrl,
+                qr_code:        link.qrCode,
+                quote,
+            });
+            return;
+        }
+
         res.status(201).json({
             transaction_id: tx._id,
             store_id:       store._id,
@@ -817,6 +861,30 @@ router.post("/:id/upgrade", authenticate, async (req: Request, res: Response) =>
             return;
         }
         res.status(500).json({ error: message });
+    }
+});
+
+router.get("/:id/upgrade/transactions/:txId", authenticate, async (req: Request, res: Response) => {
+    try {
+        const user = req.user as IUser;
+        const store = await Store.findById(req.params.id);
+        if (!ownerStoreOrFail(store, user, res)) return;
+        const safeStore = store!;
+
+        const tx = await PaymentTransaction.findOne({
+            _id: req.params.txId,
+            store_id: safeStore._id,
+            target_type: "store",
+        }).select("plan_type target_type status amount final_amount payment_method payment_ref duration_months created_at updated_at");
+
+        if (!tx) {
+            res.status(404).json({ error: "Transaction not found" });
+            return;
+        }
+
+        res.json({ transaction: tx, store: safeStore });
+    } catch (error) {
+        res.status(500).json({ error: (error as Error).message });
     }
 });
 

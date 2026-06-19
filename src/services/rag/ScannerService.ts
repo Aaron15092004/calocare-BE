@@ -7,6 +7,7 @@ import UsdaFood from "../../models/UsdaFood";
 import Food from "../../models/Food";
 import Recipe from "../../models/Recipe";
 import ApiUsage from "../../models/ApiUsage";
+import { withTimeout } from "../../utils/asyncTimeout";
 
 function trackGeminiScan(): void {
     const hour = new Date().toISOString().slice(0, 13);
@@ -43,9 +44,15 @@ export interface ScanFoodResult {
     primary_match?: ScanMatch;
     alternatives: ScanMatch[];
     fallback_used: boolean;
+    fallback_reason?: "low_confidence" | "embedding_unavailable";
+    timings_ms?: Record<string, number>;
 }
 
 const HIGH_CONFIDENCE_THRESHOLD = 0.75;
+const VISION_TIMEOUT_MS = Number(process.env.SCAN_VISION_TIMEOUT_MS ?? 15_000);
+const EMBEDDING_TIMEOUT_MS = Number(process.env.SCAN_EMBEDDING_TIMEOUT_MS ?? 8_000);
+const VECTOR_TIMEOUT_MS = Number(process.env.SCAN_VECTOR_TIMEOUT_MS ?? 2_000);
+const HYDRATE_TIMEOUT_MS = Number(process.env.SCAN_HYDRATE_TIMEOUT_MS ?? 1_500);
 
 export class ScannerService {
     private readonly gemini = getGeminiService();
@@ -54,12 +61,19 @@ export class ScannerService {
     private readonly enrichment = getEnrichmentService();
 
     async scan(req: ScanFoodRequest): Promise<ScanFoodResult> {
+        const timings_ms: Record<string, number> = {};
+
         // Step 1: Vision analysis
-        const vision = await this.gemini.vision(req.imageBase64, req.mimeType);
+        const vision = await this._timed(
+            timings_ms,
+            "vision",
+            () => this.gemini.vision(req.imageBase64, req.mimeType),
+            VISION_TIMEOUT_MS,
+        );
         trackGeminiScan();
 
         if (vision.not_food) {
-            return { vision, alternatives: [], fallback_used: false };
+            return { vision, alternatives: [], fallback_used: false, timings_ms };
         }
 
         // Step 2: Embed the identified dish name
@@ -67,13 +81,45 @@ export class ScannerService {
             .filter(Boolean)
             .join(" | ");
 
-        const queryVector = await this.embedding.embed(searchQuery, "query");
+        let queryVector: number[];
+        try {
+            queryVector = await this._timed(
+                timings_ms,
+                "embedding",
+                () => this.embedding.embed(searchQuery, "query"),
+                EMBEDDING_TIMEOUT_MS,
+            );
+        } catch {
+            return {
+                vision,
+                primary_match: this._quickVisionEstimate(vision),
+                alternatives: [],
+                fallback_used: true,
+                fallback_reason: "embedding_unavailable",
+                timings_ms,
+            };
+        }
 
         // Step 3: Parallel vector search across all collections
         const [usdaResults, foodResults, recipeResults] = await Promise.all([
-            this.retrieval.vectorSearch("usda", queryVector, { topK: 5 }).catch(() => []),
-            this.retrieval.vectorSearch("food", queryVector, { topK: 5 }).catch(() => []),
-            this.retrieval.vectorSearch("recipe", queryVector, { topK: 5 }).catch(() => []),
+            this._timed(
+                timings_ms,
+                "vector_usda",
+                () => this.retrieval.vectorSearch("usda", queryVector, { topK: 5 }),
+                VECTOR_TIMEOUT_MS,
+            ).catch(() => []),
+            this._timed(
+                timings_ms,
+                "vector_food",
+                () => this.retrieval.vectorSearch("food", queryVector, { topK: 5 }),
+                VECTOR_TIMEOUT_MS,
+            ).catch(() => []),
+            this._timed(
+                timings_ms,
+                "vector_recipe",
+                () => this.retrieval.vectorSearch("recipe", queryVector, { topK: 5 }),
+                VECTOR_TIMEOUT_MS,
+            ).catch(() => []),
         ]);
 
         // Step 4: Find best match across all results
@@ -110,12 +156,21 @@ export class ScannerService {
 
         if (topScore >= HIGH_CONFIDENCE_THRESHOLD) {
             // Good match found
-            const primary = await this._hydrateMatch(
-                allResults[0],
-                vision.estimated_portion_grams,
-            );
-            const alternatives = await Promise.all(
-                allResults.slice(1, 4).map((r) => this._hydrateMatch(r, undefined)),
+            const primary = await this._timed(
+                timings_ms,
+                "hydrate_primary",
+                () => this._hydrateMatch(allResults[0], vision.estimated_portion_grams),
+                HYDRATE_TIMEOUT_MS,
+            ).catch(() => null);
+            const alternatives = await this._timed(
+                timings_ms,
+                "hydrate_alternatives",
+                () => Promise.all(
+                    allResults.slice(1, 4).map((r) =>
+                        withTimeout(this._hydrateMatch(r, undefined), HYDRATE_TIMEOUT_MS, "hydrate_alternative").catch(() => null),
+                    ),
+                ),
+                HYDRATE_TIMEOUT_MS * 2,
             );
 
             // Queue enrichment for USDA hits
@@ -152,13 +207,14 @@ export class ScannerService {
                 primary_match: primary ?? undefined,
                 alternatives: alternatives.filter((a): a is ScanMatch => a !== null),
                 fallback_used: false,
+                timings_ms,
             };
         }
 
-        // Step 5: No confident match found. Return a clearly-labelled estimate so
-        // the core scan flow remains useful while the verified food DB is growing.
-        // This is never written back into Food/Recipe vectors.
-        const aiEstimate = await this._geminiEstimateFallback(vision).catch(() => undefined);
+        // Step 5: No confident match found. Return a quick, clearly-labelled
+        // estimate derived from the first vision pass instead of blocking the
+        // realtime scan path on a second LLM call.
+        const aiEstimate = this._quickVisionEstimate(vision);
         return {
             vision,
             primary_match: aiEstimate,
@@ -173,7 +229,23 @@ export class ScannerService {
                     fdc_id: r.fdc_id,
                 })),
             fallback_used: true,
+            fallback_reason: "low_confidence",
+            timings_ms,
         };
+    }
+
+    private async _timed<T>(
+        timings: Record<string, number>,
+        stage: string,
+        fn: () => Promise<T>,
+        timeoutMs: number,
+    ): Promise<T> {
+        const startedAt = Date.now();
+        try {
+            return await withTimeout(fn(), timeoutMs, stage);
+        } finally {
+            timings[stage] = Date.now() - startedAt;
+        }
     }
 
     private _cleanJson(raw: string): string {
@@ -188,6 +260,60 @@ export class ScannerService {
     private _clampNumber(value: unknown, min: number, max: number, fallback: number): number {
         const n = typeof value === "number" && Number.isFinite(value) ? value : fallback;
         return Math.round(Math.max(min, Math.min(max, n)) * 10) / 10;
+    }
+
+    private _quickVisionEstimate(vision: VisionResult): ScanMatch | undefined {
+        const dishName = vision.main_dish_vi || vision.main_dish_en;
+        if (!dishName || (vision.confidence ?? 0) < 0.25) return undefined;
+
+        const haystack = [
+            dishName,
+            vision.main_dish_en,
+            vision.cooking_method,
+            ...(vision.components ?? []),
+        ].join(" ").toLowerCase();
+
+        let calories = 160;
+        let protein = 6;
+        let carbs = 20;
+        let fat = 6;
+
+        if (/salad|rau|vegetable|gỏi|luộc/.test(haystack)) {
+            calories = 90; protein = 4; carbs = 12; fat = 3;
+        }
+        if (/rice|cơm|noodle|bún|phở|mì|bread|bánh mì|xôi/.test(haystack)) {
+            calories = 210; protein = 7; carbs = 34; fat = 5;
+        }
+        if (/chicken|gà|beef|bò|pork|heo|fish|cá|shrimp|tôm|egg|trứng|tofu|đậu/.test(haystack)) {
+            protein = Math.max(protein, 16);
+            calories = Math.max(calories, 190);
+            carbs = Math.min(carbs, 18);
+        }
+        if (/fried|chiên|rán|xào|stir/.test(haystack)) {
+            calories += 80;
+            fat += 9;
+        }
+        if (/grilled|nướng|roasted|quay/.test(haystack)) {
+            calories += 35;
+            fat += 4;
+        }
+        if (/soup|canh|cháo|porridge/.test(haystack)) {
+            calories = Math.min(calories, 120);
+            carbs = Math.min(carbs, 18);
+            fat = Math.min(fat, 4);
+        }
+
+        return {
+            source_type: "ai_estimate",
+            name: dishName,
+            name_en: vision.main_dish_en,
+            confidence: Math.min(0.45, Math.max(0.25, (vision.confidence ?? 0.45) * 0.55)),
+            energy_kcal: this._clampNumber(calories, 20, 650, 160),
+            protein: this._clampNumber(protein, 0, 60, 6),
+            glucid: this._clampNumber(carbs, 0, 90, 20),
+            lipid: this._clampNumber(fat, 0, 60, 6),
+            estimated_portion_grams: this._clampNumber(vision.estimated_portion_grams, 20, 1500, 200),
+        };
     }
 
     private async _geminiEstimateFallback(vision: VisionResult): Promise<ScanMatch | undefined> {
