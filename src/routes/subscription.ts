@@ -88,9 +88,9 @@ function normalizeDuration(value: unknown): number {
 }
 
 function normalizePaymentMethod(value: unknown): string {
-    const method = String(value || "bank_transfer");
-    if (!["bank_transfer", "momo", "payos"].includes(method)) {
-        throw new PaymentValidationError("Phương thức thanh toán không hợp lệ.", "invalid_payment_method");
+    const method = String(value || "payos");
+    if (method !== "payos") {
+        throw new PaymentValidationError("CaloVie hiện chỉ hỗ trợ thanh toán tự động.", "invalid_payment_method");
     }
     return method;
 }
@@ -275,32 +275,35 @@ async function activateStoreSubscription(
     await store.save();
 }
 
+async function syncPayOSPaymentStatus(tx: IPaymentTransaction): Promise<void> {
+    if (tx.status !== "pending" || tx.payment_method !== "payos" || !tx.payment_ref) return;
+
+    const orderCode = Number(tx.payment_ref);
+    if (!Number.isFinite(orderCode)) return;
+
+    try {
+        const paymentLink = await getPayOS().paymentRequests.get(orderCode);
+        if (paymentLink.status !== "PAID") return;
+        if (Number(paymentLink.amountPaid || 0) < tx.final_amount) {
+            console.warn(`[subscription] PayOS order ${orderCode} is PAID but amount is insufficient.`);
+            return;
+        }
+
+        const paymentReference = paymentLink.transactions?.[0]?.reference || tx.payment_ref;
+        if (tx.target_type === "store") {
+            await activateStoreSubscription(tx, paymentReference);
+        } else {
+            await activateSubscription(tx, paymentReference);
+        }
+    } catch (error) {
+        console.warn("[subscription] PayOS status sync failed:", error instanceof Error ? error.message : String(error));
+    }
+}
+
 // ── Helpers ──────────────────��─────────────────────────────────���──────────────
 
 function buildRef(txId: string): string {
     return `CALO${txId.slice(-8).toUpperCase()}`;
-}
-
-function getPaymentInstructions(method: string, amount: number, ref: string) {
-    const formatted = amount.toLocaleString("vi-VN");
-    if (method === "momo") {
-        return {
-            method: "MoMo",
-            phone: process.env.PAYMENT_MOMO_PHONE || "0912345678",
-            amount: formatted,
-            note: ref,
-            message: `Chuyển ${formatted}₫ qua MoMo đến ${process.env.PAYMENT_MOMO_PHONE || "0912345678"} nội dung: ${ref}`,
-        };
-    }
-    return {
-        method: "Chuyển khoản ngân hàng",
-        bank: process.env.PAYMENT_BANK_NAME || "Vietcombank",
-        account: process.env.PAYMENT_BANK_ACCOUNT || "1234567890",
-        owner: process.env.PAYMENT_BANK_OWNER || "CALOVIE",
-        amount: formatted,
-        note: ref,
-        message: `Chuyển ${formatted}₫ tới TK ${process.env.PAYMENT_BANK_ACCOUNT || "1234567890"} (${process.env.PAYMENT_BANK_NAME || "Vietcombank"}) nội dung: ${ref}`,
-    };
 }
 
 // ── Routes ────────────────────────────────────────────────────────────────────
@@ -471,6 +474,8 @@ router.get("/transactions/:txId", authenticate, async (req: Request, res: Respon
             return;
         }
 
+        await syncPayOSPaymentStatus(tx);
+
         const fullUser = await User.findById(user._id).select("subscription_tier subscription_expires_at");
         const effectiveTier = fullUser
             ? getEffectiveUserTier(fullUser.subscription_tier, fullUser.subscription_expires_at)
@@ -500,9 +505,8 @@ router.post("/upgrade", authenticate, async (req: Request, res: Response) => {
             discount_code: req.body.discount_code,
         });
 
-        // ── Guard: block duplicate pending transactions (PM-01) ─────────────
-        // If a pending transaction for the same plan was created within the last
-        // 2 hours, return it instead of creating a duplicate.
+        // PayOS-only guard: reuse the latest pending automatic checkout and sync
+        // it with PayOS before asking the user/admin to do anything manually.
         const twoHoursAgo = new Date(Date.now() - 2 * 60 * 60 * 1000);
         const existingPending = await PaymentTransaction.findOne({
             user_id: user._id,
@@ -510,14 +514,30 @@ router.post("/upgrade", authenticate, async (req: Request, res: Response) => {
             target_type: "user",
             duration_months: quote.duration_months,
             status: "pending",
+            payment_method: "payos",
             created_at: { $gte: twoHoursAgo },
         }).sort({ created_at: -1 });
 
         if (existingPending) {
+            await syncPayOSPaymentStatus(existingPending);
+            if (existingPending.status === "completed") {
+                res.status(200).json({
+                    transaction_id: existingPending._id,
+                    tx_id: existingPending._id,
+                    plan_type: existingPending.plan_type,
+                    status: existingPending.status,
+                    amount: existingPending.amount,
+                    final_amount: existingPending.final_amount,
+                    payment_method: "payos",
+                    created_at: existingPending.created_at,
+                });
+                return;
+            }
+
             const ref = buildRef(String(existingPending._id));
             res.status(409).json({
                 error: "pending_transaction_exists",
-                message: "Bạn đã có giao dịch đang chờ thanh toán. Vui lòng hoàn tất hoặc đợi 2 giờ trước khi tạo mới.",
+                message: "Bạn đã có giao dịch thanh toán tự động đang chờ. Nếu đã thanh toán, trang trạng thái sẽ tự cập nhật trong vài giây.",
                 transaction_id: existingPending._id,
                 tx_id: existingPending._id,
                 plan_type: existingPending.plan_type,
@@ -527,11 +547,6 @@ router.post("/upgrade", authenticate, async (req: Request, res: Response) => {
                 amount: existingPending.amount,
                 final_amount: existingPending.final_amount,
                 payment_method: existingPending.payment_method,
-                payment_instructions: getPaymentInstructions(
-                    existingPending.payment_method || "bank_transfer",
-                    existingPending.final_amount,
-                    ref,
-                ),
                 created_at: existingPending.created_at,
             });
             return;
@@ -592,17 +607,7 @@ router.post("/upgrade", authenticate, async (req: Request, res: Response) => {
             });
         }
 
-        // ── Bank transfer / MoMo fallback ────────────────────────────────────
-        res.status(201).json({
-            transaction_id: tx._id,
-            plan_type: quote.plan_type,
-            amount:       quote.amount,
-            final_amount: quote.final_amount,
-            status:       "pending",
-            payment_ref_code: ref,
-            payment_instructions: getPaymentInstructions(paymentMethod, quote.final_amount, ref),
-            quote,
-        });
+        throw new PaymentValidationError("CaloVie hiện chỉ hỗ trợ thanh toán tự động.", "invalid_payment_method");
     } catch (error) {
         respondWithError(res, error);
     }

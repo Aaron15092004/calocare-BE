@@ -153,11 +153,11 @@ function normalizeStoreProDuration(value: unknown): number {
     return months;
 }
 
-type StorePaymentMethod = "bank_transfer" | "momo" | "payos";
+type StorePaymentMethod = "payos";
 
 function normalizeStorePaymentMethod(value: unknown): StorePaymentMethod {
-    const method = String(value || "bank_transfer");
-    if (method !== "bank_transfer" && method !== "momo" && method !== "payos") {
+    const method = String(value || "payos");
+    if (method !== "payos") {
         throw new Error("invalid_payment_method");
     }
     return method;
@@ -176,31 +176,6 @@ function buildStoreProQuote(durationMonths: number) {
         duration_discount_pct: discountPct,
         duration_discount_amount: amount - finalAmount,
         currency: "VND",
-    };
-}
-
-function getStorePaymentInstructions(method: Exclude<StorePaymentMethod, "payos">, amount: number, ref: string) {
-    const formatted = amount.toLocaleString("vi-VN");
-    if (method === "momo") {
-        const phone = process.env.PAYMENT_MOMO_PHONE || "0912345678";
-        return {
-            method: "MoMo",
-            phone,
-            amount: formatted,
-            note: ref,
-            message: `Chuyển ${formatted}₫ qua MoMo đến ${phone} nội dung: ${ref}`,
-        };
-    }
-    const account = process.env.PAYMENT_BANK_ACCOUNT || "1234567890";
-    const bank = process.env.PAYMENT_BANK_NAME || "Vietcombank";
-    return {
-        method: "Chuyển khoản ngân hàng",
-        bank,
-        account,
-        owner: process.env.PAYMENT_BANK_OWNER || "CALOVIE",
-        amount: formatted,
-        note: ref,
-        message: `Chuyển ${formatted}₫ tới TK ${account} (${bank}) nội dung: ${ref}`,
     };
 }
 
@@ -763,11 +738,11 @@ router.post("/:id/upgrade", authenticate, async (req: Request, res: Response) =>
             store_id:       store._id,
             duration_months: durationMonths,
             status:         "pending",
+            payment_method: "payos",
             created_at:     { $gte: twoHoursAgo },
         }).sort({ created_at: -1 });
 
         if (existingPending) {
-            const ref = `STORE${String(existingPending._id).slice(-8).toUpperCase()}`;
             const existingMethod = (existingPending.payment_method || paymentMethod) as StorePaymentMethod;
             res.status(409).json({
                 error: "pending_transaction_exists",
@@ -778,15 +753,7 @@ router.post("/:id/upgrade", authenticate, async (req: Request, res: Response) =>
                 final_amount:   existingPending.final_amount,
                 status:         existingPending.status,
                 payment_method: existingMethod,
-                ...(existingMethod === "payos"
-                    ? { payment_ref: existingPending.payment_ref }
-                    : {
-                        payment_instructions: getStorePaymentInstructions(
-                            existingMethod,
-                            existingPending.final_amount,
-                            ref,
-                        ),
-                    }),
+                payment_ref:    existingPending.payment_ref,
             });
             return;
         }
@@ -840,16 +807,7 @@ router.post("/:id/upgrade", authenticate, async (req: Request, res: Response) =>
             return;
         }
 
-        res.status(201).json({
-            transaction_id: tx._id,
-            store_id:       store._id,
-            amount:         quote.amount,
-            final_amount:   quote.final_amount,
-            status:         "pending",
-            payment_method: paymentMethod,
-            payment_instructions: getStorePaymentInstructions(paymentMethod, quote.final_amount, ref),
-            quote,
-        });
+        res.status(400).json({ error: "invalid_payment_method", message: "CaloVie hiện chỉ hỗ trợ thanh toán tự động." });
     } catch (error) {
         const message = (error as Error).message;
         if (message === "invalid_duration") {
@@ -857,7 +815,7 @@ router.post("/:id/upgrade", authenticate, async (req: Request, res: Response) =>
             return;
         }
         if (message === "invalid_payment_method") {
-            res.status(400).json({ error: "invalid_payment_method", message: "Phương thức thanh toán không hợp lệ." });
+            res.status(400).json({ error: "invalid_payment_method", message: "CaloVie hiện chỉ hỗ trợ thanh toán tự động." });
             return;
         }
         res.status(500).json({ error: message });
@@ -880,6 +838,32 @@ router.get("/:id/upgrade/transactions/:txId", authenticate, async (req: Request,
         if (!tx) {
             res.status(404).json({ error: "Transaction not found" });
             return;
+        }
+
+        if (tx.status === "pending" && tx.payment_method === "payos" && tx.payment_ref) {
+            const orderCode = Number(tx.payment_ref);
+            if (Number.isFinite(orderCode)) {
+                try {
+                    const paymentLink = await getPayOS().paymentRequests.get(orderCode);
+                    if (paymentLink.status === "PAID" && Number(paymentLink.amountPaid || 0) >= tx.final_amount) {
+                        tx.status = "completed";
+                        tx.payment_ref = paymentLink.transactions?.[0]?.reference || tx.payment_ref;
+                        await tx.save();
+
+                        const now = new Date();
+                        const base = safeStore.subscription_expires_at && safeStore.subscription_expires_at > now
+                            ? safeStore.subscription_expires_at
+                            : now;
+                        const expiry = new Date(base);
+                        expiry.setMonth(expiry.getMonth() + tx.duration_months);
+                        safeStore.subscription_tier = "pro";
+                        safeStore.subscription_expires_at = expiry;
+                        await safeStore.save();
+                    }
+                } catch (error) {
+                    console.warn("[stores] PayOS status sync failed:", error instanceof Error ? error.message : String(error));
+                }
+            }
         }
 
         res.json({ transaction: tx, store: safeStore });
