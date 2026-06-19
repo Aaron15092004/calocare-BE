@@ -19,6 +19,7 @@ export interface VisionItemResult {
   name_en: string;
   estimated_portion_grams: number;
   confidence: number;
+  components?: string[];
 }
 
 export interface MultiVisionResult {
@@ -133,22 +134,25 @@ If the image does not contain food, set not_food: true and use empty strings for
     imageBase64: string,
     mimeType: string,
   ): Promise<MultiVisionResult> {
-    const prompt = `Analyze this food image that may contain MULTIPLE dishes or food items. Identify ALL distinct dishes/foods visible.
+    const prompt = `Analyze this food image that may contain MULTIPLE dishes or food items. Identify ALL distinct Vietnamese-relevant dishes/foods visible.
 Respond ONLY with valid JSON (no markdown, no explanation).
 
 Required format:
 {
   "items": [
-    { "name_vi": "Tên món (tiếng Việt)", "name_en": "Dish name (English)", "estimated_portion_grams": 200, "confidence": 0.9 },
-    { "name_vi": "Tên món 2", "name_en": "Dish 2", "estimated_portion_grams": 150, "confidence": 0.85 }
+    { "name_vi": "Tên món (tiếng Việt)", "name_en": "Dish name (English)", "estimated_portion_grams": 200, "confidence": 0.9, "components": ["cơm", "sườn", "dưa leo"] },
+    { "name_vi": "Tên món 2", "name_en": "Dish 2", "estimated_portion_grams": 150, "confidence": 0.85, "components": ["thành phần nhìn thấy"] }
   ],
   "not_food": false
 }
 
 Rules:
 - List every distinct food item you can identify separately.
+- Prefer common Vietnamese dish names when the image looks like Vietnamese food.
+- Do not split a composed dish into ingredients unless the image clearly shows separate foods on the plate.
 - If only one food item is visible, return an array with one element.
 - If the image does not contain food, set not_food: true and items: [].
+- Components are visible ingredients only; keep them short.
 - Confidence 0–1 (how certain you are about the identification).`;
 
     const result = await this.model.generateContent([

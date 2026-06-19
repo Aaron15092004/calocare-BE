@@ -11,6 +11,20 @@ import Food from "../models/Food";
 
 const router = Router();
 
+function round1(value: unknown): number {
+    const n = Number(value);
+    if (!Number.isFinite(n)) return 0;
+    return Math.round(n * 10) / 10;
+}
+
+function parseServingSize(value: unknown): number {
+    if (typeof value === "number" && Number.isFinite(value) && value > 0) return Math.round(value);
+    if (typeof value !== "string") return 100;
+    const match = value.replace(",", ".").match(/([\d.]+)\s*(g|gr|gram|ml|mL)?/i);
+    const parsed = match ? Number(match[1]) : NaN;
+    return Number.isFinite(parsed) && parsed > 0 ? Math.round(parsed) : 100;
+}
+
 const upload = multer({
     storage: multer.memoryStorage(),
     limits: { fileSize: 5 * 1024 * 1024 },
@@ -178,18 +192,22 @@ router.get(
 
         // 1. Check local Food DB
         const localFood = await Food.findOne({ code: barcode, is_approved: true })
-            .select("name_vi name_en energy_kcal protein lipid glucid fiber")
+            .select("name_vi name_en energy_kcal protein lipid glucid fiber image_url source_reference")
             .lean();
         if (localFood) {
             res.json({
                 source: "local",
+                barcode,
                 name: localFood.name_vi,
                 name_en: localFood.name_en,
+                image_url: localFood.image_url,
+                db_food_id: localFood._id,
                 per_100g: {
-                    calories: localFood.energy_kcal,
-                    protein: localFood.protein,
-                    carbs: localFood.glucid,
-                    fat: localFood.lipid,
+                    calories: round1(localFood.energy_kcal),
+                    protein: round1(localFood.protein),
+                    carbs: round1(localFood.glucid),
+                    fat: round1(localFood.lipid),
+                    fiber: round1(localFood.fiber),
                 },
                 serving_size: 100,
                 serving_unit: "g",
@@ -200,7 +218,7 @@ router.get(
         // 2. Open Food Facts (free, no API key)
         try {
             const offRes = await axios.get<any>(
-                `https://world.openfoodfacts.org/api/v2/product/${barcode}?fields=product_name,product_name_vi,nutriments,serving_size`,
+                `https://world.openfoodfacts.org/api/v2/product/${barcode}?fields=product_name,product_name_vi,product_name_en,generic_name_vi,generic_name,brands,nutriments,serving_size,image_front_url,image_url,categories_tags,nova_group,nutriscore_grade`,
                 { timeout: 8000 },
             );
             const p = offRes.data?.product;
@@ -208,14 +226,20 @@ router.get(
                 const n = p.nutriments;
                 res.json({
                     source: "open_food_facts",
-                    name: p.product_name_vi || p.product_name || "Sản phẩm đóng gói",
+                    barcode,
+                    name: p.product_name_vi || p.product_name_en || p.product_name || p.generic_name_vi || p.generic_name || "Sản phẩm đóng gói",
+                    brand: p.brands,
+                    image_url: p.image_front_url || p.image_url,
+                    nutriscore_grade: p.nutriscore_grade,
+                    nova_group: p.nova_group,
                     per_100g: {
-                        calories: Math.round(n["energy-kcal_100g"] ?? (n["energy_100g"] != null ? n["energy_100g"] / 4.184 : 0)),
-                        protein: n.proteins_100g ?? 0,
-                        carbs: n.carbohydrates_100g ?? 0,
-                        fat: n.fat_100g ?? 0,
+                        calories: round1(n["energy-kcal_100g"] ?? (n["energy_100g"] != null ? Number(n["energy_100g"]) / 4.184 : 0)),
+                        protein: round1(n.proteins_100g),
+                        carbs: round1(n.carbohydrates_100g),
+                        fat: round1(n.fat_100g),
+                        fiber: round1(n.fiber_100g),
                     },
-                    serving_size: parseFloat(p.serving_size) || 100,
+                    serving_size: parseServingSize(p.serving_size),
                     serving_unit: "g",
                 });
                 return;
@@ -233,12 +257,15 @@ router.get(
                     if (nutrition) {
                         res.json({
                             source: "fatsecret",
+                            barcode,
                             name: fsFood.food_name,
+                            image_url: getFatSecretService().extractImage(fsFood) ?? undefined,
                             per_100g: {
-                                calories: nutrition.energy_kcal,
-                                protein: nutrition.protein,
-                                carbs: nutrition.glucid,
-                                fat: nutrition.lipid,
+                                calories: round1(nutrition.energy_kcal),
+                                protein: round1(nutrition.protein),
+                                carbs: round1(nutrition.glucid),
+                                fat: round1(nutrition.lipid),
+                                fiber: round1(nutrition.fiber),
                             },
                             serving_size: 100,
                             serving_unit: "g",

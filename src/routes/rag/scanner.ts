@@ -2,7 +2,7 @@ import { Router, Request, Response } from "express";
 import multer from "multer";
 import { authenticate } from "../../middleware/auth";
 import { ragRateLimit } from "../../middleware/ragRateLimit";
-import { getScannerService, ScanMatch } from "../../services/rag/ScannerService";
+import { getScannerService, ScanMealDish } from "../../services/rag/ScannerService";
 import { IUser } from "../../models/User";
 import { logRag } from "../../utils/logger";
 import { isOperationTimeoutError } from "../../utils/asyncTimeout";
@@ -22,18 +22,20 @@ const upload = multer({
     },
 });
 
-// Map internal ScanMatch → client field names expected by RagScannerModal
-function toClientMatch(m: ScanMatch) {
+function dishToClientMatch(dish: ScanMealDish) {
+    const grams = Math.max(1, dish.weight_grams || 100);
+    const factor = 100 / grams;
     return {
-        source_id: m.source_id ?? "",
-        source_type: m.source_type as "food" | "recipe" | "usda",
-        name: m.name,
-        name_vi: m.name,
-        score: m.confidence,
-        energy_kcal: m.energy_kcal,
-        protein_g: m.protein,
-        carbs_g: m.glucid,
-        fat_g: m.lipid,
+        source_id: dish.source_id ?? dish.fs_food_id ?? "",
+        source_type: dish.source,
+        name: dish.matched_name || dish.dish_name,
+        name_vi: dish.matched_name || dish.dish_name,
+        score: dish.confidence,
+        energy_kcal: Math.round(dish.nutrition.calories * factor),
+        protein_g: Math.round(dish.nutrition.protein * factor * 10) / 10,
+        carbs_g: Math.round(dish.nutrition.carbs * factor * 10) / 10,
+        fat_g: Math.round(dish.nutrition.fat * factor * 10) / 10,
+        fiber_g: Math.round(dish.nutrition.fiber * factor * 10) / 10,
         diet_tags: [] as string[],
     };
 }
@@ -138,14 +140,14 @@ router.post("/", authenticate, ragRateLimit("scan"), upload.single("image"), asy
 
     try {
         const service = getScannerService();
-        const result = await service.scan({
+        const result = await service.scanMeal({
             imageBase64,
             mimeType,
             userId: user?._id?.toString(),
         });
         if (clientAborted || res.headersSent) return;
 
-        if (result.vision.not_food) {
+        if (result.not_food) {
             logRag({
                 endpoint: "scan",
                 userId: user?._id?.toString(),
@@ -161,23 +163,21 @@ router.post("/", authenticate, ragRateLimit("scan"), upload.single("image"), asy
             return;
         }
 
-        // Primary match exists and is a real DB record (not AI estimate)
-        const matched = !!result.primary_match &&
-            result.primary_match.source_type !== "ai_estimate";
+        if (result.dishes.length === 0) {
+            res.status(422).json({ error: "Chưa nhận diện được món ăn đủ rõ. Bạn thử ảnh sáng và gần món hơn nhé." });
+            return;
+        }
 
-        const match = matched && result.primary_match
-            ? toClientMatch(result.primary_match)
-            : undefined;
-
-        // AI estimate only when fallback actually ran and returned data
+        const primary = result.dishes[0];
+        const matched = result.dishes.some((dish) => dish.source !== "ai_estimate");
+        const match = primary.source !== "ai_estimate" ? dishToClientMatch(primary) : undefined;
         const ai_estimate =
-            !matched &&
-            result.primary_match?.source_type === "ai_estimate"
+            primary.source === "ai_estimate"
                 ? {
-                      calories_per_100g: result.primary_match.energy_kcal ?? 0,
-                      protein_per_100g: result.primary_match.protein ?? 0,
-                      fat_per_100g: result.primary_match.lipid ?? 0,
-                      carbs_per_100g: result.primary_match.glucid ?? 0,
+                      calories_per_100g: dishToClientMatch(primary).energy_kcal,
+                      protein_per_100g: dishToClientMatch(primary).protein_g,
+                      fat_per_100g: dishToClientMatch(primary).fat_g,
+                      carbs_per_100g: dishToClientMatch(primary).carbs_g,
                   }
                 : undefined;
 
@@ -197,14 +197,16 @@ router.post("/", authenticate, ragRateLimit("scan"), upload.single("image"), asy
         res.json({
             matched,
             match,
-            description: result.vision.main_dish_vi || result.vision.main_dish_en,
+            description: primary.dish_name,
             ai_estimate,
-            confidence: result.primary_match?.confidence ?? result.vision.confidence,
-            alternatives: result.alternatives.map(toClientMatch),
+            confidence: primary.confidence,
+            alternatives: result.dishes.slice(1).map(dishToClientMatch),
             fallback_reason: result.fallback_reason,
-            serving_grams:
-                clampServingGrams(result.primary_match?.estimated_portion_grams) ??
-                clampServingGrams(result.vision.estimated_portion_grams),
+            serving_grams: clampServingGrams(primary.weight_grams),
+            dishes: result.dishes,
+            totals: result.totals,
+            vitamins: result.vitamins,
+            meal_type: result.meal_type,
         });
     } catch (err) {
         if (clientAborted || res.headersSent) return;

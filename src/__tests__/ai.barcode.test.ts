@@ -26,6 +26,8 @@ jest.mock("../services/rag/ScannerService", () => ({
 jest.mock("../services/rag/FatSecretService", () => ({
   getFatSecretService: jest.fn(() => ({
     findByBarcode: jest.fn(),
+    extractPer100g: jest.fn(),
+    extractImage: jest.fn(),
   })),
 }));
 
@@ -84,6 +86,8 @@ describe("GET /api/ai/barcode/:barcode", () => {
         protein: 9,
         glucid: 49,
         lipid: 3.2,
+        fiber: 2.5,
+        image_url: "https://example.com/local.jpg",
       })
     );
 
@@ -92,7 +96,10 @@ describe("GET /api/ai/barcode/:barcode", () => {
     expect(res.status).toBe(200);
     expect(res.body.source).toBe("local");
     expect(res.body.name).toBe("Bánh mì sandwich");
+    expect(res.body.barcode).toBe("8935001234567");
+    expect(res.body.image_url).toBe("https://example.com/local.jpg");
     expect(res.body.per_100g.calories).toBe(265);
+    expect(res.body.per_100g.fiber).toBe(2.5);
     expect(Food.findOne).toHaveBeenCalledWith({ code: "8935001234567", is_approved: true });
   });
 
@@ -103,11 +110,17 @@ describe("GET /api/ai/barcode/:barcode", () => {
         product: {
           product_name: "Coca-Cola 330ml",
           product_name_vi: "Coca-Cola",
+          brands: "Coca-Cola",
+          image_front_url: "https://example.com/coke.jpg",
+          serving_size: "330 ml",
+          nutriscore_grade: "e",
+          nova_group: 4,
           nutriments: {
             "energy-kcal_100g": 42,
             proteins_100g: 0,
             carbohydrates_100g: 10.6,
             fat_100g: 0,
+            fiber_100g: 0.1,
           },
         },
       },
@@ -118,8 +131,14 @@ describe("GET /api/ai/barcode/:barcode", () => {
     expect(res.status).toBe(200);
     expect(res.body.source).toBe("open_food_facts");
     expect(res.body.name).toBe("Coca-Cola");
+    expect(res.body.brand).toBe("Coca-Cola");
+    expect(res.body.image_url).toBe("https://example.com/coke.jpg");
+    expect(res.body.serving_size).toBe(330);
+    expect(res.body.nutriscore_grade).toBe("e");
+    expect(res.body.nova_group).toBe(4);
     expect(res.body.per_100g.calories).toBe(42);
     expect(res.body.per_100g.carbs).toBeCloseTo(10.6);
+    expect(res.body.per_100g.fiber).toBeCloseTo(0.1);
   });
 
   it("returns 404 when not found in any source", async () => {
