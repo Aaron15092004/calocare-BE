@@ -5,7 +5,7 @@ const config: Config = {
   testEnvironment: "node",
   testMatch: ["<rootDir>/src/__tests__/**/*.test.ts"],
   transform: {
-    "^.+\\.ts$": ["ts-jest", { tsconfig: { esModuleInterop: true, module: "CommonJS" } }],
+    "^.+\\.ts$": ["ts-jest", { tsconfig: { esModuleInterop: true, module: "CommonJS", types: ["node", "jest"] } }],
   },
   clearMocks: true,
   testTimeout: 10000,

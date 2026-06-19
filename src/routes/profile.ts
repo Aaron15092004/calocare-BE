@@ -54,6 +54,7 @@ router.put("/", authenticate, async (req: Request, res: Response) => {
             avatar_url: updated.avatar_url,
             role: updated.role,
             subscription_tier: updated.subscription_tier,
+            subscription_expires_at: updated.subscription_expires_at ?? null,
             language: updated.language,
             daily_nutrition_goals: updated.daily_nutrition_goals,
             preferences: updated.preferences,

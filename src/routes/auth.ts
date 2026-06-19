@@ -20,6 +20,7 @@ import Food from "../models/Food";
 import EnrichmentQueue from "../models/EnrichmentQueue";
 import { generateAccessToken, generateRefreshToken, verifyRefreshToken } from "../utils/jwt";
 import { authenticate } from "../middleware/auth";
+import { downgradeExpiredUserSubscription } from "../utils/subscriptionEntitlements";
 
 const router = Router();
 
@@ -94,6 +95,7 @@ router.post("/register", authLimiter, async (req: Request, res: Response) => {
                 avatar_url: user.avatar_url,
                 role: user.role,
                 subscription_tier: user.subscription_tier,
+                subscription_expires_at: user.subscription_expires_at ?? null,
                 language: user.language,
                 daily_nutrition_goals: user.daily_nutrition_goals,
                 preferences: user.preferences,
@@ -121,6 +123,7 @@ router.post("/login", authLimiter, async (req: Request, res: Response) => {
             res.status(403).json({ error: "Account is banned" });
             return;
         }
+        await downgradeExpiredUserSubscription(user);
 
         const accessToken = generateAccessToken(user._id.toString());
         const refreshToken = generateRefreshToken(user._id.toString());
@@ -136,6 +139,7 @@ router.post("/login", authLimiter, async (req: Request, res: Response) => {
                 avatar_url: user.avatar_url,
                 role: user.role,
                 subscription_tier: user.subscription_tier,
+                subscription_expires_at: user.subscription_expires_at ?? null,
                 language: user.language,
                 daily_nutrition_goals: user.daily_nutrition_goals,
                 preferences: user.preferences,

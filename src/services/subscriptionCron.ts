@@ -129,18 +129,23 @@ async function sendRenewalReminders(): Promise<void> {
 // ── Register all cron jobs ─────────────────────────────────────────────────────
 
 export function startCronJobs(): void {
-    // Expire subscriptions: 00:05 Vietnam time (UTC+7 = 17:05 UTC previous day)
-    // Cron expression in server local time — uses UTC if TZ not set
-    // Schedule as 17:05 UTC = 00:05 ICT
-    cron.schedule("5 17 * * *", async () => {
-        console.log("[cron] Running subscription expiry check…");
+    const runExpiryCheck = async (source: "startup" | "schedule") => {
+        console.log(`[cron] Running subscription expiry check (${source})…`);
         await expireUserSubscriptions().catch((err) =>
             console.error("[cron] expireUserSubscriptions error:", err),
         );
         await expireStoreSubscriptions().catch((err) =>
             console.error("[cron] expireStoreSubscriptions error:", err),
         );
+    };
+
+    // Expire subscriptions: 00:05 Vietnam time.
+    cron.schedule("5 0 * * *", () => {
+        void runExpiryCheck("schedule");
     }, { timezone: "Asia/Ho_Chi_Minh" });
+
+    // Catch subscriptions that expired while the server was down/redeploying.
+    void runExpiryCheck("startup");
 
     // Renewal reminders: 09:00 Vietnam time
     cron.schedule("0 9 * * *", async () => {

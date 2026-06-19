@@ -1,20 +1,16 @@
 import { Request, Response, NextFunction } from "express";
 import mongoose from "mongoose";
 import { IUser } from "../models/User";
+import { getEffectiveUserTier } from "../utils/subscriptionEntitlements";
 
-type Tier = "free" | "premium" | "family" | "pro";
+type Tier = "free" | "premium" | "family";
 type Endpoint = "search" | "chat" | "scan" | "meal-plan";
 
-function normalizeTier(tier?: string | null): Tier {
-    if (tier === "pro") return "family";
-    return (tier as Tier) || "free";
-}
-
 const LIMITS: Record<Endpoint, Record<Tier, number>> = {
-    search:      { free: 20,  premium: 200, family: -1, pro: -1 },
-    chat:        { free: 5,   premium: 100, family: -1, pro: -1 },
-    scan:        { free: 2,   premium: 5,   family: -1, pro: -1 },
-    "meal-plan": { free: 0,   premium: 1,   family: 5,  pro: 5 },
+    search:      { free: 20, premium: 200, family: -1 },
+    chat:        { free: 5, premium: 100, family: -1 },
+    scan:        { free: 2, premium: 5, family: -1 },
+    "meal-plan": { free: 0, premium: 1, family: 5 },
 };
 
 // Free tier base scan limit; rewarded ads can add up to this many bonus credits
@@ -138,7 +134,7 @@ export function ragRateLimit(endpoint: Endpoint) {
         const user = req.user as IUser | undefined;
         if (!user) { next(); return; }
 
-        const tier = normalizeTier(user.subscription_tier);
+        const tier = getEffectiveUserTier(user.subscription_tier, user.subscription_expires_at);
         const limit = LIMITS[endpoint][tier] ?? 0;
 
         if (limit === -1) { next(); return; }

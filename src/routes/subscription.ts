@@ -8,6 +8,7 @@ import DiscountCode from "../models/DiscountCode";
 import SystemSettings from "../models/SystemSettings";
 import { PayOS } from "@payos/node";
 import { sendPaymentConfirmed } from "../services/emailService";
+import { getEffectiveUserTier } from "../utils/subscriptionEntitlements";
 
 // Returns the active global discount percentage (0 if none, expired, or plan not in applicable_plans)
 async function getGlobalDiscountPct(planType?: string): Promise<number> {
@@ -50,6 +51,153 @@ const PLANS: Record<PlanType, { name: string; price_monthly: number; tier: strin
     store_pro: { name: "Store Pro", price_monthly: 49000, tier: "pro" },
 };
 
+type UserPlanType = "premium" | "family";
+
+const USER_PLAN_ALIASES: Record<string, UserPlanType> = {
+    premium: "premium",
+    family: "family",
+    pro: "family",
+};
+
+const ALLOWED_DURATIONS = [1, 3, 6, 12] as const;
+const DURATION_DISCOUNT_PCT: Record<number, number> = {
+    1: 0,
+    3: 5,
+    6: 10,
+    12: 15,
+};
+
+class PaymentValidationError extends Error {
+    status: number;
+    code: string;
+
+    constructor(message: string, code = "payment_validation_error", status = 400) {
+        super(message);
+        this.status = status;
+        this.code = code;
+    }
+}
+
+function respondWithError(res: Response, error: unknown): void {
+    if (error instanceof PaymentValidationError) {
+        res.status(error.status).json({ error: error.code, message: error.message });
+        return;
+    }
+    res.status(500).json({ error: (error as Error).message });
+}
+
+function normalizeUserPlan(planType: unknown): UserPlanType {
+    const key = String(planType || "").toLowerCase();
+    const normalized = USER_PLAN_ALIASES[key];
+    if (!normalized) {
+        throw new PaymentValidationError("Gói thanh toán không hợp lệ.", "invalid_plan_type");
+    }
+    return normalized;
+}
+
+function normalizeDuration(value: unknown): number {
+    const months = Number(value ?? 1);
+    if (!Number.isInteger(months) || !ALLOWED_DURATIONS.includes(months as typeof ALLOWED_DURATIONS[number])) {
+        throw new PaymentValidationError("Thời hạn gói chỉ hỗ trợ 1, 3, 6 hoặc 12 tháng.", "invalid_duration");
+    }
+    return months;
+}
+
+function normalizePaymentMethod(value: unknown): string {
+    const method = String(value || "bank_transfer");
+    if (!["bank_transfer", "momo", "payos"].includes(method)) {
+        throw new PaymentValidationError("Phương thức thanh toán không hợp lệ.", "invalid_payment_method");
+    }
+    return method;
+}
+
+function applyPct(amount: number, pct: number): { amount: number; discount: number } {
+    if (pct <= 0) return { amount, discount: 0 };
+    const next = Math.max(0, Math.round(amount * (1 - pct / 100)));
+    return { amount: next, discount: amount - next };
+}
+
+async function buildUserQuote(input: {
+    plan_type: unknown;
+    duration_months?: unknown;
+    discount_code?: unknown;
+}) {
+    const planType = normalizeUserPlan(input.plan_type);
+    const durationMonths = normalizeDuration(input.duration_months);
+    const plan = PLANS[planType];
+    const baseAmount = plan.price_monthly * durationMonths;
+
+    const durationPct = DURATION_DISCOUNT_PCT[durationMonths] ?? 0;
+    const durationApplied = applyPct(baseAmount, durationPct);
+
+    const globalPct = await getGlobalDiscountPct(planType);
+    const globalApplied = applyPct(durationApplied.amount, globalPct);
+
+    let finalAmount = globalApplied.amount;
+    let discountCode: string | undefined;
+    let discountCodeAmount = 0;
+    let discountCodeMeta: { type: "percentage" | "fixed"; value: number } | null = null;
+
+    const rawCode = typeof input.discount_code === "string" ? input.discount_code.trim().toUpperCase() : "";
+    if (rawCode) {
+        const now = new Date();
+        const code = await DiscountCode.findOne({ code: rawCode, is_active: true });
+        if (!code) {
+            throw new PaymentValidationError("Mã giảm giá không hợp lệ hoặc đã bị tắt.", "invalid_discount_code");
+        }
+        if (code.starts_at && code.starts_at > now) {
+            throw new PaymentValidationError("Mã giảm giá chưa đến thời gian sử dụng.", "discount_not_started");
+        }
+        if (code.expires_at && code.expires_at < now) {
+            throw new PaymentValidationError("Mã giảm giá đã hết hạn.", "discount_expired");
+        }
+        if (code.max_uses && code.used_count >= code.max_uses) {
+            throw new PaymentValidationError("Mã giảm giá đã hết lượt sử dụng.", "discount_usage_limit_reached");
+        }
+        if (code.min_purchase && finalAmount < code.min_purchase) {
+            throw new PaymentValidationError(
+                `Đơn hàng cần tối thiểu ${code.min_purchase.toLocaleString("vi-VN")}₫ để dùng mã này.`,
+                "discount_min_purchase_not_met",
+            );
+        }
+        if (!Number.isFinite(code.discount_value) || code.discount_value <= 0) {
+            throw new PaymentValidationError("Mã giảm giá chưa được cấu hình đúng.", "invalid_discount_value");
+        }
+        if (code.discount_type === "percentage" && code.discount_value > 100) {
+            throw new PaymentValidationError("Mã giảm giá phần trăm không được vượt quá 100%.", "invalid_discount_value");
+        }
+
+        discountCode = rawCode;
+        discountCodeMeta = { type: code.discount_type, value: code.discount_value };
+        if (code.discount_type === "percentage") {
+            const applied = applyPct(finalAmount, code.discount_value);
+            finalAmount = applied.amount;
+            discountCodeAmount = applied.discount;
+        } else {
+            discountCodeAmount = Math.min(finalAmount, code.discount_value);
+            finalAmount = Math.max(0, finalAmount - code.discount_value);
+        }
+    }
+
+    return {
+        plan_type: planType,
+        plan_name: plan.name,
+        tier: plan.tier,
+        duration_months: durationMonths,
+        price_monthly: plan.price_monthly,
+        amount: baseAmount,
+        final_amount: finalAmount,
+        currency: "VND",
+        duration_discount_pct: durationPct,
+        duration_discount_amount: durationApplied.discount,
+        global_discount_pct: globalPct,
+        global_discount_amount: globalApplied.discount,
+        discount_code: discountCode,
+        discount_code_amount: discountCodeAmount,
+        discount_code_meta: discountCodeMeta,
+    };
+}
+
 // ── Shared activation helper (idempotent) ─────────────────────────���───────────
 
 async function activateSubscription(
@@ -58,6 +206,9 @@ async function activateSubscription(
 ): Promise<void> {
     // Guard — idempotent: do nothing if already completed
     if (tx.status === "completed") return;
+    if (tx.status !== "pending") {
+        throw new PaymentValidationError("Giao dịch không còn ở trạng thái chờ thanh toán.", "transaction_not_pending");
+    }
 
     tx.status = "completed";
     if (paymentRef) tx.payment_ref = paymentRef;
@@ -65,6 +216,7 @@ async function activateSubscription(
 
     const plan = PLANS[tx.plan_type];
     if (!plan) return;
+    if (tx.target_type !== "user" || !["premium", "family"].includes(plan.tier)) return;
 
     const now = new Date();
     const user = await User.findById(tx.user_id);
@@ -90,6 +242,23 @@ async function activateSubscription(
             console.error("[subscription] Failed to send payment confirmed email:", err),
         );
     }
+
+    if (tx.discount_code) {
+        const result = await DiscountCode.updateOne(
+            {
+                code: tx.discount_code.toUpperCase(),
+                $or: [
+                    { max_uses: { $exists: false } },
+                    { max_uses: null },
+                    { $expr: { $lt: ["$used_count", "$max_uses"] } },
+                ],
+            },
+            { $inc: { used_count: 1 } },
+        );
+        if (result.modifiedCount === 0) {
+            console.warn(`[subscription] Discount code ${tx.discount_code} was paid but no usage slot was available.`);
+        }
+    }
 }
 
 // ── Helpers ──────────────────��─────────────────────────────────���──────────────
@@ -113,7 +282,7 @@ function getPaymentInstructions(method: string, amount: number, ref: string) {
         method: "Chuyển khoản ngân hàng",
         bank: process.env.PAYMENT_BANK_NAME || "Vietcombank",
         account: process.env.PAYMENT_BANK_ACCOUNT || "1234567890",
-        owner: process.env.PAYMENT_BANK_OWNER || "CALOCARE",
+        owner: process.env.PAYMENT_BANK_OWNER || "CALOVIE",
         amount: formatted,
         note: ref,
         message: `Chuyển ${formatted}₫ tới TK ${process.env.PAYMENT_BANK_ACCOUNT || "1234567890"} (${process.env.PAYMENT_BANK_NAME || "Vietcombank"}) nội dung: ${ref}`,
@@ -226,6 +395,10 @@ router.get("/plans", async (_req, res) => {
                 },
             },
         ],
+        duration_options: ALLOWED_DURATIONS.map((months) => ({
+            months,
+            discount_pct: DURATION_DISCOUNT_PCT[months],
+        })),
     });
 });
 
@@ -238,19 +411,16 @@ router.get("/status", authenticate, async (req: Request, res: Response) => {
         );
         if (!fullUser) { res.status(404).json({ error: "User not found" }); return; }
 
-        const isActive =
-            fullUser.subscription_tier === "free" ||
-            (fullUser.subscription_expires_at != null &&
-                fullUser.subscription_expires_at > new Date());
+        const effectiveTier = getEffectiveUserTier(fullUser.subscription_tier, fullUser.subscription_expires_at);
 
         const recent = await PaymentTransaction.findOne({ user_id: user._id })
             .sort({ created_at: -1 })
             .select("plan_type status amount final_amount payment_method payment_ref created_at");
 
         res.json({
-            tier: fullUser.subscription_tier,
+            tier: effectiveTier,
             expires_at: fullUser.subscription_expires_at,
-            is_active: isActive,
+            is_active: effectiveTier !== "free",
             latest_transaction: recent || null,
         });
     } catch (error) {
@@ -258,16 +428,63 @@ router.get("/status", authenticate, async (req: Request, res: Response) => {
     }
 });
 
+// POST /api/subscription/quote — authoritative pricing preview for checkout
+router.post("/quote", authenticate, async (req: Request, res: Response) => {
+    try {
+        const quote = await buildUserQuote({
+            plan_type: req.body.plan_type,
+            duration_months: req.body.duration_months,
+            discount_code: req.body.discount_code,
+        });
+        res.json(quote);
+    } catch (error) {
+        respondWithError(res, error);
+    }
+});
+
+// GET /api/subscription/transactions/:txId — poll one transaction for realtime UX
+router.get("/transactions/:txId", authenticate, async (req: Request, res: Response) => {
+    try {
+        const user = req.user as IUser;
+        const tx = await PaymentTransaction.findOne({
+            _id: req.params.txId,
+            user_id: user._id,
+            target_type: "user",
+        }).select("plan_type status amount final_amount payment_method payment_ref duration_months discount_code created_at updated_at");
+
+        if (!tx) {
+            res.status(404).json({ error: "Transaction not found" });
+            return;
+        }
+
+        const fullUser = await User.findById(user._id).select("subscription_tier subscription_expires_at");
+        const effectiveTier = fullUser
+            ? getEffectiveUserTier(fullUser.subscription_tier, fullUser.subscription_expires_at)
+            : "free";
+
+        res.json({
+            transaction: tx,
+            subscription: fullUser ? {
+                tier: effectiveTier,
+                expires_at: fullUser.subscription_expires_at,
+                is_active: effectiveTier !== "free",
+            } : null,
+        });
+    } catch (error) {
+        respondWithError(res, error);
+    }
+});
+
 // POST /api/subscription/upgrade — create pending payment order
 router.post("/upgrade", authenticate, async (req: Request, res: Response) => {
     try {
         const user = req.user as IUser;
-        const { plan_type, duration_months = 1, payment_method = "bank_transfer", discount_code } = req.body;
-
-        if (!PLANS[plan_type as PlanType]) {
-            res.status(400).json({ error: "Invalid plan type" });
-            return;
-        }
+        const paymentMethod = normalizePaymentMethod(req.body.payment_method);
+        const quote = await buildUserQuote({
+            plan_type: req.body.plan_type,
+            duration_months: req.body.duration_months,
+            discount_code: req.body.discount_code,
+        });
 
         // ── Guard: block duplicate pending transactions (PM-01) ─────────────
         // If a pending transaction for the same plan was created within the last
@@ -275,69 +492,54 @@ router.post("/upgrade", authenticate, async (req: Request, res: Response) => {
         const twoHoursAgo = new Date(Date.now() - 2 * 60 * 60 * 1000);
         const existingPending = await PaymentTransaction.findOne({
             user_id: user._id,
-            plan_type,
+            plan_type: quote.plan_type,
             target_type: "user",
+            duration_months: quote.duration_months,
             status: "pending",
             created_at: { $gte: twoHoursAgo },
         }).sort({ created_at: -1 });
 
         if (existingPending) {
+            const ref = buildRef(String(existingPending._id));
             res.status(409).json({
                 error: "pending_transaction_exists",
                 message: "Bạn đã có giao dịch đang chờ thanh toán. Vui lòng hoàn tất hoặc đợi 2 giờ trước khi tạo mới.",
+                transaction_id: existingPending._id,
                 tx_id: existingPending._id,
+                plan_type: existingPending.plan_type,
+                status: existingPending.status,
                 payment_ref: buildRef(String(existingPending._id)),
-                amount: existingPending.final_amount,
+                payment_ref_code: ref,
+                amount: existingPending.amount,
+                final_amount: existingPending.final_amount,
                 payment_method: existingPending.payment_method,
+                payment_instructions: getPaymentInstructions(
+                    existingPending.payment_method || "bank_transfer",
+                    existingPending.final_amount,
+                    ref,
+                ),
                 created_at: existingPending.created_at,
             });
             return;
         }
 
-        const plan = PLANS[plan_type as PlanType];
-        let baseAmount = plan.price_monthly * Number(duration_months);
-        let finalAmount = baseAmount;
-
-        // Apply global system-wide discount first (respects applicable_plans)
-        const globalPct = await getGlobalDiscountPct(plan_type);
-        if (globalPct > 0) {
-            finalAmount = Math.round(finalAmount * (1 - globalPct / 100));
-        }
-
-        // Then apply user's discount code on top of the already-discounted total
-        if (discount_code) {
-            const code = await DiscountCode.findOne({
-                code: discount_code.toUpperCase(),
-                is_active: true,
-                $or: [{ expires_at: null }, { expires_at: { $gt: new Date() } }],
-            });
-            if (code) {
-                if (code.discount_type === "percentage") {
-                    finalAmount = Math.round(finalAmount * (1 - code.discount_value / 100));
-                } else {
-                    finalAmount = Math.max(0, finalAmount - code.discount_value);
-                }
-                await DiscountCode.findByIdAndUpdate(code._id, { $inc: { used_count: 1 } });
-            }
-        }
-
         const tx = await PaymentTransaction.create({
             user_id: user._id,
-            plan_type,
+            plan_type: quote.plan_type,
             target_type: "user",
-            duration_months: Number(duration_months),
-            amount: baseAmount,
-            final_amount: finalAmount,
-            discount_code: discount_code || undefined,
+            duration_months: quote.duration_months,
+            amount: quote.amount,
+            final_amount: quote.final_amount,
+            discount_code: quote.discount_code || undefined,
             status: "pending",
-            payment_method,
+            payment_method: paymentMethod,
         });
 
         const txId = String(tx._id);
         const ref  = buildRef(txId);
 
         // ── PayOS checkout link ──────────────────────────────────────────────
-        if (payment_method === "payos") {
+        if (paymentMethod === "payos") {
             const payos      = getPayOS();
             const clientUrl  = process.env.CLIENT_URL || "http://localhost:2004";
             // orderCode: 32-bit unsigned int derived from last 8 hex chars of txId
@@ -347,14 +549,14 @@ router.post("/upgrade", authenticate, async (req: Request, res: Response) => {
 
             const link = await payos.paymentRequests.create({
                 orderCode,
-                amount: finalAmount,
+                amount: quote.final_amount,
                 description,
                 returnUrl: `${clientUrl}/subscription/success?txId=${txId}`,
                 cancelUrl:  `${clientUrl}/subscription/cancel?txId=${txId}`,
                 items: [{
-                    name:     `${plan.name} ${Number(duration_months)}th`,
+                    name:     `${quote.plan_name} ${quote.duration_months}th`,
                     quantity: 1,
-                    price:    finalAmount,
+                    price:    quote.final_amount,
                 }],
             });
 
@@ -364,28 +566,30 @@ router.post("/upgrade", authenticate, async (req: Request, res: Response) => {
 
             return res.status(201).json({
                 transaction_id: tx._id,
-                plan_type,
-                amount:       baseAmount,
-                final_amount: finalAmount,
+                plan_type: quote.plan_type,
+                amount:       quote.amount,
+                final_amount: quote.final_amount,
                 status:       "pending",
                 payment_method: "payos",
                 checkout_url:  link.checkoutUrl,
                 qr_code:       link.qrCode,
+                quote,
             });
         }
 
         // ── Bank transfer / MoMo fallback ────────────────────────────────────
         res.status(201).json({
             transaction_id: tx._id,
-            plan_type,
-            amount:       baseAmount,
-            final_amount: finalAmount,
+            plan_type: quote.plan_type,
+            amount:       quote.amount,
+            final_amount: quote.final_amount,
             status:       "pending",
             payment_ref_code: ref,
-            payment_instructions: getPaymentInstructions(payment_method, finalAmount, ref),
+            payment_instructions: getPaymentInstructions(paymentMethod, quote.final_amount, ref),
+            quote,
         });
     } catch (error) {
-        res.status(500).json({ error: (error as Error).message });
+        respondWithError(res, error);
     }
 });
 
@@ -398,13 +602,22 @@ router.post("/webhook/bank", async (req: Request, res: Response) => {
 
         // Validate webhook secret
         const expectedSecret = process.env.WEBHOOK_SECRET;
-        if (expectedSecret && secret !== expectedSecret) {
+        if (!expectedSecret) {
+            res.status(503).json({ error: "Payment webhook secret is not configured" });
+            return;
+        }
+        if (secret !== expectedSecret) {
             res.status(401).json({ error: "Invalid webhook secret" });
             return;
         }
 
         if (!ref) {
             res.status(400).json({ error: "ref is required" });
+            return;
+        }
+        const paidAmount = Number(amount);
+        if (!Number.isFinite(paidAmount)) {
+            res.status(400).json({ error: "amount is required" });
             return;
         }
 
@@ -422,8 +635,7 @@ router.post("/webhook/bank", async (req: Request, res: Response) => {
             return;
         }
 
-        // Optional amount validation
-        if (amount !== undefined && Number(amount) < tx.final_amount) {
+        if (paidAmount < tx.final_amount) {
             res.status(400).json({ error: "Payment amount insufficient" });
             return;
         }
@@ -432,7 +644,7 @@ router.post("/webhook/bank", async (req: Request, res: Response) => {
 
         res.json({ message: "Subscription activated", transaction_id: tx._id });
     } catch (error) {
-        res.status(500).json({ error: (error as Error).message });
+        respondWithError(res, error);
     }
 });
 
@@ -458,6 +670,7 @@ router.post("/webhook/payos", async (req: Request, res: Response) => {
         const tx = await PaymentTransaction.findOne({
             payment_ref: String(webhookData.orderCode),
             target_type: "user",
+            status: "pending",
         });
 
         if (!tx) {
@@ -470,7 +683,7 @@ router.post("/webhook/payos", async (req: Request, res: Response) => {
 
         res.json({ message: "activated", transaction_id: tx._id });
     } catch (error) {
-        res.status(500).json({ error: (error as Error).message });
+        respondWithError(res, error);
     }
 });
 
@@ -503,11 +716,16 @@ router.post("/verify/:ref", authenticate, requireAdmin, async (req: Request, res
             return;
         }
 
+        if (tx.status !== "pending") {
+            res.status(400).json({ error: "Transaction is not pending" });
+            return;
+        }
+
         await activateSubscription(tx, req.body.payment_ref || undefined);
 
         res.json({ message: "Subscription activated", transaction_id: tx._id });
     } catch (error) {
-        res.status(500).json({ error: (error as Error).message });
+        respondWithError(res, error);
     }
 });
 
@@ -519,8 +737,8 @@ router.post("/confirm/:txId", authenticate, requireAdmin, async (req: Request, r
             res.status(404).json({ error: "Transaction not found" });
             return;
         }
-        if (tx.status === "completed") {
-            res.status(400).json({ error: "Already completed" });
+        if (tx.status !== "pending") {
+            res.status(400).json({ error: "Transaction is not pending" });
             return;
         }
 
@@ -528,7 +746,7 @@ router.post("/confirm/:txId", authenticate, requireAdmin, async (req: Request, r
 
         res.json({ message: "Payment confirmed, subscription activated", transaction_id: tx._id });
     } catch (error) {
-        res.status(500).json({ error: (error as Error).message });
+        respondWithError(res, error);
     }
 });
 
@@ -560,23 +778,11 @@ router.get("/admin/pending", authenticate, requireAdmin, async (_req, res: Respo
 // ── IAP webhook (mobile u2192 server after RevenueCat purchase) ─────────────────
 // Called optimistically by the mobile app; real entitlement sync goes through
 // the RevenueCat server-to-server webhook configured in the RC dashboard.
-router.post("/iap-webhook", authenticate, async (req: Request, res: Response) => {
-    try {
-        const user = req.user as IUser;
-        const { tier } = req.body as { tier?: string; platform?: string; customer_id?: string };
-
-        if (!tier || !["premium", "family", "pro", "free"].includes(tier)) {
-            return res.status(400).json({ error: "Invalid tier" });
-        }
-
-        await User.findByIdAndUpdate(user._id, {
-            subscription_tier: tier === "pro" ? "family" : tier,
-        });
-
-        res.json({ ok: true, tier: tier === "pro" ? "family" : tier });
-    } catch (error) {
-        res.status(500).json({ error: (error as Error).message });
-    }
+router.post("/iap-webhook", authenticate, async (_req: Request, res: Response) => {
+    res.status(410).json({
+        error: "iap_client_sync_disabled",
+        message: "IAP entitlement changes must be verified by a server-to-server provider webhook.",
+    });
 });
 
 export default router;

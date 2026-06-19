@@ -2,7 +2,7 @@ import { getGeminiService, VisionResult, VisionItemResult } from "./GeminiServic
 import { getEmbeddingService } from "./EmbeddingService";
 import { getRetrievalService, UnifiedSearchResult } from "./RetrievalService";
 import { getEnrichmentService } from "./EnrichmentService";
-import AISuggestedFood from "../../models/AISuggestedFood";
+import { Types } from "mongoose";
 import UsdaFood from "../../models/UsdaFood";
 import Food from "../../models/Food";
 import Recipe from "../../models/Recipe";
@@ -130,7 +130,9 @@ export class ScannerService {
                 this.enrichment
                     .queueEnrichment(usdaHits, {
                         type: "scan",
-                        user_id: req.userId ? undefined : undefined,
+                        user_id: req.userId && Types.ObjectId.isValid(req.userId)
+                            ? new Types.ObjectId(req.userId)
+                            : undefined,
                     })
                     .catch(() => {});
             }
@@ -153,13 +155,13 @@ export class ScannerService {
             };
         }
 
-        // Step 5: No confident match found.
-        // TODO(post-deploy): re-enable _geminiEstimateFallback once USDA+Food vector
-        //   index covers ≥ 80% of Vietnamese foods. For now, return no match so the
-        //   client shows "not found" instead of hallucinated nutrition data.
+        // Step 5: No confident match found. Return a clearly-labelled estimate so
+        // the core scan flow remains useful while the verified food DB is growing.
+        // This is never written back into Food/Recipe vectors.
+        const aiEstimate = await this._geminiEstimateFallback(vision).catch(() => undefined);
         return {
             vision,
-            primary_match: undefined,
+            primary_match: aiEstimate,
             alternatives: allResults
                 .slice(0, 3)
                 .filter((r) => r.raw_score > 0.4)
@@ -171,6 +173,67 @@ export class ScannerService {
                     fdc_id: r.fdc_id,
                 })),
             fallback_used: true,
+        };
+    }
+
+    private _cleanJson(raw: string): string {
+        return raw
+            .trim()
+            .replace(/^```json\s*/i, "")
+            .replace(/^```\s*/i, "")
+            .replace(/```\s*$/i, "")
+            .trim();
+    }
+
+    private _clampNumber(value: unknown, min: number, max: number, fallback: number): number {
+        const n = typeof value === "number" && Number.isFinite(value) ? value : fallback;
+        return Math.round(Math.max(min, Math.min(max, n)) * 10) / 10;
+    }
+
+    private async _geminiEstimateFallback(vision: VisionResult): Promise<ScanMatch | undefined> {
+        const dishName = vision.main_dish_vi || vision.main_dish_en;
+        if (!dishName || (vision.confidence ?? 0) < 0.35) return undefined;
+
+        const response = await this.gemini.generate(
+            [
+                {
+                    role: "system",
+                    content:
+                        "Bạn ước tính dinh dưỡng món ăn theo khẩu phần phổ biến. " +
+                        "Chỉ trả JSON hợp lệ, không markdown. Không dùng claim y tế.",
+                },
+                {
+                    role: "user",
+                    content:
+                        `Ước tính dinh dưỡng trung bình trên 100g cho món: ${dishName}\n` +
+                        `Tên tiếng Anh: ${vision.main_dish_en || ""}\n` +
+                        `Thành phần nhìn thấy: ${(vision.components ?? []).join(", ")}\n` +
+                        `Cách nấu: ${vision.cooking_method || "unknown"}\n` +
+                        `JSON format: {"calories_per_100g":150,"protein_per_100g":8,"carbs_per_100g":20,"fat_per_100g":5,"confidence":0.4}`,
+                },
+            ],
+            { temperature: 0.2, maxTokens: 300 },
+        );
+
+        type Estimate = {
+            calories_per_100g?: number;
+            protein_per_100g?: number;
+            carbs_per_100g?: number;
+            fat_per_100g?: number;
+            confidence?: number;
+        };
+        const parsed = JSON.parse(this._cleanJson(response.content)) as Estimate;
+        const calories = this._clampNumber(parsed.calories_per_100g, 5, 900, 150);
+        return {
+            source_type: "ai_estimate",
+            name: dishName,
+            name_en: vision.main_dish_en,
+            confidence: Math.min(0.55, this._clampNumber(parsed.confidence, 0.2, 0.55, 0.4)),
+            energy_kcal: calories,
+            protein: this._clampNumber(parsed.protein_per_100g, 0, 80, 5),
+            glucid: this._clampNumber(parsed.carbs_per_100g, 0, 100, 20),
+            lipid: this._clampNumber(parsed.fat_per_100g, 0, 80, 5),
+            estimated_portion_grams: this._clampNumber(vision.estimated_portion_grams, 20, 1500, 200),
         };
     }
 

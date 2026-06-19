@@ -24,6 +24,9 @@ export interface IUser extends Document {
     preferences: Record<string, unknown>;
     refresh_tokens: string[];
     referral_code?: string;
+    family_group_id?: mongoose.Types.ObjectId;
+    family_role?: "owner" | "member";
+    family_access_source?: mongoose.Types.ObjectId;
     created_at: Date;
     updated_at: Date;
     comparePassword(candidatePassword: string): Promise<boolean>;
@@ -51,6 +54,9 @@ const UserSchema = new Schema<IUser>(
         preferences: { type: Schema.Types.Mixed, default: {} },
         refresh_tokens: [{ type: String, select: false }],
         referral_code: { type: String, sparse: true, unique: true },
+        family_group_id: { type: Schema.Types.ObjectId, ref: "FamilyGroup" },
+        family_role: { type: String, enum: ["owner", "member"] },
+        family_access_source: { type: Schema.Types.ObjectId, ref: "FamilyGroup" },
     },
     {
         timestamps: { createdAt: "created_at", updatedAt: "updated_at" },

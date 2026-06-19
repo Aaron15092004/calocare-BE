@@ -31,7 +31,7 @@ export interface RagLogEntry {
     fallback_used?: boolean;
     // meal-plan only: how many meals came from each real source vs AI
     source_breakdown?: { usda: number; recipe: number; food: number; ai_generated: number };
-    status: "ok" | "error" | "rate_limited";
+    status: "ok" | "error" | "rate_limited" | "not_food";
     error?: string;
 }
 

@@ -30,9 +30,9 @@ const PaymentTransactionSchema = new Schema<IPaymentTransaction>(
         },
         target_type: { type: String, enum: ["user", "store"], default: "user" },
         store_id: { type: Schema.Types.ObjectId, ref: "Store" },
-        duration_months: { type: Number, default: 1 },
-        amount: { type: Number, required: true },
-        final_amount: { type: Number, required: true },
+        duration_months: { type: Number, default: 1, min: 1, max: 12 },
+        amount: { type: Number, required: true, min: 0 },
+        final_amount: { type: Number, required: true, min: 0 },
         discount_code: { type: String },
         status: {
             type: String,
@@ -48,5 +48,8 @@ const PaymentTransactionSchema = new Schema<IPaymentTransaction>(
         timestamps: { createdAt: "created_at", updatedAt: "updated_at" },
     },
 );
+
+PaymentTransactionSchema.index({ payment_ref: 1, target_type: 1 });
+PaymentTransactionSchema.index({ status: 1, target_type: 1, created_at: -1 });
 
 export default mongoose.model<IPaymentTransaction>("PaymentTransaction", PaymentTransactionSchema);

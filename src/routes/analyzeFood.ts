@@ -30,6 +30,11 @@ function escapeRegex(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
+function clampEstimatedGrams(value: unknown): number {
+  const n = typeof value === "number" && Number.isFinite(value) ? value : 200;
+  return Math.round(Math.max(20, Math.min(1500, n)));
+}
+
 function cleanJson(raw: string): string {
   let s = raw.trim();
   if (s.startsWith("```json")) s = s.slice(7);
@@ -126,7 +131,7 @@ router.post(
           .map((d) => ({
             name_vi: ((d.name_vi || d.name || "") as string).trim(),
             name_en: ((d.name_en || d.name || "") as string).trim(),
-            weight_grams: Math.max(10, (d.weight_grams as number) || 200),
+            weight_grams: clampEstimatedGrams(d.weight_grams),
           }))
           .filter((d) => d.name_vi.length > 0 || d.name_en.length > 0);
       } catch {
@@ -245,32 +250,9 @@ router.post(
           continue;
         }
 
-        // 2d. AI Suggested Food cache (from prior Gemini estimates)
-        const aiCacheHit = await AISuggestedFood.findOne({
-          $or: [
-            { name: { $regex: patternVi } },
-            { name: { $regex: patternEn } },
-          ],
-        });
-
-        if (aiCacheHit) {
-          const refWeight = g > 0 ? g : aiCacheHit.reference_weight_grams;
-          results.push({
-            dish_name: displayName,
-            source: "ai_estimate",
-            matched_name: aiCacheHit.name,
-            nutrition: {
-              calories: Math.round((aiCacheHit.calories_per_100g * refWeight) / 100),
-              protein: Math.round((aiCacheHit.protein_per_100g * refWeight) / 100),
-              carbs:   Math.round((aiCacheHit.carbs_per_100g * refWeight) / 100),
-              fat:     Math.round((aiCacheHit.fat_per_100g * refWeight) / 100),
-              fiber:   Math.round((aiCacheHit.fiber_per_100g * refWeight) / 100),
-            },
-            weight_grams: refWeight,
-          });
-          AISuggestedFood.updateOne({ _id: aiCacheHit._id }, { $inc: { times_seen: 1 } }).exec();
-          continue;
-        }
+        // Do not reuse historical AI-estimated nutrition as a verified match.
+        // Those records are useful for review/import queues only; serving them
+        // directly would make one hallucinated estimate repeat across users.
 
         // 2e. USDA — use English name against description_en for accurate matching
         // USDA descriptions are long English strings ("Potatoes, boiled, cooked in skin...")
@@ -382,7 +364,7 @@ router.post(
                 const carb100 = aiItem.carbs_per_100g    || 0;
                 const fat100  = aiItem.fat_per_100g      || 0;
                 const fib100  = aiItem.fiber_per_100g    || 0;
-                const weight  = aiItem.weight_grams || (target.weight_grams as number) || 300;
+                const weight  = clampEstimatedGrams(aiItem.weight_grams || target.weight_grams || 300);
                 target.source = "ai_estimate";
                 target.matched_name = aiItem.name || target.dish_name;
                 target.weight_grams = weight;
@@ -419,7 +401,7 @@ router.post(
         if (r.source === "none") {
           r.source = "ai_estimate";
           r.matched_name = r.dish_name;
-          r.weight_grams = (r.weight_grams as number) || 300;
+          r.weight_grams = clampEstimatedGrams(r.weight_grams || 300);
           r.nutrition = { calories: 0, protein: 0, carbs: 0, fat: 0, fiber: 0 };
           r.unmatched = true;
         }
@@ -463,12 +445,16 @@ router.post(
         { calories: 0, protein: 0, carbs: 0, fat: 0, fiber: 0 },
       );
 
-      console.log(
-        `[analyzeFood] ${(user as any).email ?? user._id} →`,
-        results
-          .map((r) => `${r.dish_name}[${r.source}→${r.matched_name ?? "?"}|${r.weight_grams ?? "?"}g]`)
-          .join("  "),
-      );
+      const sourceSummary = results.reduce<Record<string, number>>((acc, r) => {
+        const source = String(r.source ?? "unknown");
+        acc[source] = (acc[source] ?? 0) + 1;
+        return acc;
+      }, {});
+      console.log("[analyzeFood] completed", {
+        user_id: String(user._id),
+        dish_count: results.length,
+        source_summary: sourceSummary,
+      });
 
       res.json({ dishes: results, totals, vitamins, meal_type: guessMealType() });
     } catch (error) {

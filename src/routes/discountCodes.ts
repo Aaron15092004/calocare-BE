@@ -62,7 +62,7 @@ router.post("/", authenticate, requireAdmin, async (req: Request, res: Response)
 
 router.put("/:id", authenticate, requireAdmin, async (req: Request, res: Response) => {
     try {
-        const code = await DiscountCode.findByIdAndUpdate(req.params.id, req.body, { new: true });
+        const code = await DiscountCode.findByIdAndUpdate(req.params.id, req.body, { new: true, runValidators: true });
         if (!code) { res.status(404).json({ error: "Code not found" }); return; }
         res.json(code);
     } catch (error) {

@@ -40,7 +40,7 @@ interface MealItem {
     meal_type: "breakfast" | "lunch" | "dinner" | "snack" | "morning_snack" | "afternoon_snack";
     food_name: string;
     food_id?: string;
-    source_type?: "food" | "recipe" | "usda";
+    source_type?: "food" | "recipe" | "usda" | "ai_generated";
     fdc_id?: number;
     weight_grams: number;
     calories: number;
@@ -60,7 +60,7 @@ interface NutritionTotals {
 // Per-meal-type list of real DB candidates so the fallback never invents recipes
 interface CandidateEntry {
     source_id: string;
-    source_type: "food" | "recipe" | "usda";
+    source_type: "food" | "recipe" | "usda" | "ai_generated";
     name: string;
     energy_kcal?: number;
     protein?: number;
@@ -145,6 +145,33 @@ const PROTEIN_ROTATIONS = [
     "salmon tuna",
 ];
 
+const STARTER_CANDIDATES: Record<string, CandidateEntry[]> = {
+    breakfast: [
+        { source_id: "starter:chao-yen-mach-chuoi", source_type: "ai_generated", name: "Cháo yến mạch chuối", energy_kcal: 110, protein: 4, carbs: 20, fat: 2, fiber: 3 },
+        { source_id: "starter:banh-mi-trung", source_type: "ai_generated", name: "Bánh mì trứng", energy_kcal: 230, protein: 10, carbs: 32, fat: 8, fiber: 2 },
+        { source_id: "starter:pho-ga-it-beo", source_type: "ai_generated", name: "Phở gà ít béo", energy_kcal: 95, protein: 9, carbs: 12, fat: 3, fiber: 1 },
+        { source_id: "starter:xoi-dau-xanh", source_type: "ai_generated", name: "Xôi đậu xanh", energy_kcal: 210, protein: 6, carbs: 40, fat: 3, fiber: 2 },
+    ],
+    lunch: [
+        { source_id: "starter:com-ga-rau-xanh", source_type: "ai_generated", name: "Cơm gạo lứt ức gà rau xanh", energy_kcal: 145, protein: 13, carbs: 17, fat: 3, fiber: 3 },
+        { source_id: "starter:bun-thit-nuong-rau", source_type: "ai_generated", name: "Bún thịt nướng rau", energy_kcal: 180, protein: 9, carbs: 22, fat: 6, fiber: 2 },
+        { source_id: "starter:dau-hu-sot-ca-chua", source_type: "ai_generated", name: "Đậu hũ sốt cà chua cơm gạo lứt", energy_kcal: 130, protein: 7, carbs: 18, fat: 4, fiber: 3 },
+        { source_id: "starter:ca-hap-com-rau", source_type: "ai_generated", name: "Cá hấp rau củ cơm trắng", energy_kcal: 120, protein: 12, carbs: 13, fat: 3, fiber: 2 },
+    ],
+    dinner: [
+        { source_id: "starter:salad-ga-ap-chao", source_type: "ai_generated", name: "Salad gà áp chảo", energy_kcal: 110, protein: 14, carbs: 6, fat: 4, fiber: 3 },
+        { source_id: "starter:canh-dau-hu-rau-cu", source_type: "ai_generated", name: "Canh đậu hũ rau củ", energy_kcal: 70, protein: 5, carbs: 8, fat: 2, fiber: 3 },
+        { source_id: "starter:com-ca-hap-rau-luoc", source_type: "ai_generated", name: "Cơm cá hấp rau luộc", energy_kcal: 125, protein: 12, carbs: 14, fat: 3, fiber: 2 },
+        { source_id: "starter:thit-nac-kho-rau", source_type: "ai_generated", name: "Thịt nạc kho rau luộc", energy_kcal: 155, protein: 13, carbs: 10, fat: 7, fiber: 2 },
+    ],
+    snack: [
+        { source_id: "starter:chuoi", source_type: "ai_generated", name: "Chuối", energy_kcal: 89, protein: 1, carbs: 23, fat: 0.3, fiber: 2.6 },
+        { source_id: "starter:sua-chua-khong-duong", source_type: "ai_generated", name: "Sữa chua không đường", energy_kcal: 61, protein: 3.5, carbs: 4.7, fat: 3.3, fiber: 0 },
+        { source_id: "starter:tao", source_type: "ai_generated", name: "Táo", energy_kcal: 52, protein: 0.3, carbs: 14, fat: 0.2, fiber: 2.4 },
+        { source_id: "starter:dau-hu-non", source_type: "ai_generated", name: "Đậu hũ non", energy_kcal: 55, protein: 5, carbs: 2, fat: 3, fiber: 1 },
+    ],
+};
+
 const GOAL_LABELS: Record<GoalType, string> = {
     weight_loss: "Giảm cân",
     muscle_gain: "Tăng cơ",
@@ -193,6 +220,20 @@ export class MealPlanGeneratorService {
         const allergies = prefs?.allergies           as string[] | undefined;
         const diet      = prefs?.dietary_preference  as string | undefined;
 
+        const effectiveReq: GenerateMealPlanRequest = {
+            ...req,
+            preferences: {
+                ...(req.preferences ?? {}),
+                dietary_preference: req.preferences?.dietary_preference ?? diet,
+                allergies: this._uniqueStrings([
+                    ...(Array.isArray(allergies) ? allergies : []),
+                    ...(req.preferences?.allergies ?? []),
+                ]),
+            },
+        };
+        const effectiveDiet = effectiveReq.preferences?.dietary_preference;
+        const effectiveAllergies = effectiveReq.preferences?.allergies;
+
         // Auto-TDEE via Mifflin-St Jeor if profile is complete; fall back to stored goal
         const tdee = this._calculateTDEE({ weight_kg: w, height_cm: h, age, gender, activity_level: activity });
         const baseCalories = tdee ?? user?.daily_nutrition_goals?.calories ?? 2000;
@@ -223,8 +264,8 @@ export class MealPlanGeneratorService {
         if (bmi) bioLines.push(`BMI ${bmi}(${bmiCat})`);
         if (activity) bioLines.push(activityLabels[activity] ?? activity);
         if (tdee) bioLines.push(`TDEE ~${tdee}kcal/ngày`);
-        if (diet && diet !== "omnivore") bioLines.push(`chế độ ăn: ${diet}`);
-        if (allergies?.length) bioLines.push(`tránh: ${allergies.join(", ")}`);
+        if (effectiveDiet && effectiveDiet !== "omnivore") bioLines.push(`chế độ ăn: ${effectiveDiet}`);
+        if (effectiveAllergies?.length) bioLines.push(`tránh: ${effectiveAllergies.join(", ")}`);
         const userBio = bioLines.length ? bioLines.join(" · ") : undefined;
 
         // Create MealPlan record
@@ -256,7 +297,7 @@ export class MealPlanGeneratorService {
                     result = await this._generateDay(
                         day,
                         dailyTargets,
-                        req,
+                        effectiveReq,
                         recentFoodNames,
                         attempts,
                         userBio,
@@ -303,6 +344,16 @@ export class MealPlanGeneratorService {
                 let food_id: Types.ObjectId | undefined;
                 let usda_food_id: Types.ObjectId | undefined;
                 let source_type: string | undefined;
+                let custom_food: {
+                    name: string;
+                    calories_kcal: number;
+                    protein_g: number;
+                    carbs_g: number;
+                    fat_g: number;
+                    fiber_g?: number;
+                    serving_description?: string;
+                    description?: string;
+                } | undefined;
 
                 if (meal.food_id && meal.source_type) {
                     source_type = meal.source_type;
@@ -314,6 +365,8 @@ export class MealPlanGeneratorService {
                         if (enriched) {
                             recipe_id = enriched; // enriched USDA dish → Recipe._id
                         }
+                    } else if (meal.source_type === "ai_generated") {
+                        custom_food = this._toCustomFood(meal);
                     } else {
                         food_id = new Types.ObjectId(meal.food_id);
                     }
@@ -332,6 +385,12 @@ export class MealPlanGeneratorService {
                         recipe_id = new Types.ObjectId(fallback.source_id);
                     } else if (fallback.source_type === "usda") {
                         usda_food_id = new Types.ObjectId(fallback.source_id);
+                    } else if (fallback.source_type === "ai_generated") {
+                        custom_food = this._toCustomFood({
+                            ...meal,
+                            food_name: fallback.name,
+                            source_type: "ai_generated",
+                        });
                     } else {
                         food_id = new Types.ObjectId(fallback.source_id);
                     }
@@ -345,7 +404,14 @@ export class MealPlanGeneratorService {
                             carbs:   Math.round((fallback.carbs   ?? 0) * meal.weight_grams / 100 * 10) / 10,
                             fat:     Math.round((fallback.fat     ?? 0) * meal.weight_grams / 100 * 10) / 10,
                         };
+                        if (fallback.source_type === "ai_generated") {
+                            custom_food = this._toCustomFood(meal);
+                        }
                     }
+                }
+
+                if (source_type === "ai_generated" && !custom_food) {
+                    custom_food = this._toCustomFood(meal);
                 }
 
                 // Track source breakdown for logging
@@ -361,6 +427,7 @@ export class MealPlanGeneratorService {
                     recipe_id,
                     food_id,
                     usda_food_id,
+                    custom_food,
                     source_type,
                     serving_size: meal.weight_grams,
                     calories: meal.calories,
@@ -376,10 +443,29 @@ export class MealPlanGeneratorService {
             // Scale serving sizes BEFORE commit so stored data is already calibrated
             const { meals: adjustedMeals, scaleFactor } = this._adjustDayCalories(dayPlan.meals, dailyTargets, day);
             if (scaleFactor !== 1) {
-                const typedItems = itemsToInsert as Array<{ serving_size: number; calories: number }>;
-                for (const item of typedItems) {
-                    item.serving_size = Math.round(item.serving_size * scaleFactor);
-                    item.calories     = Math.round(item.calories     * scaleFactor);
+                const typedItems = itemsToInsert as Array<{
+                    serving_size: number;
+                    calories: number;
+                    custom_food?: {
+                        calories_kcal: number;
+                        protein_g: number;
+                        carbs_g: number;
+                        fat_g: number;
+                        serving_description?: string;
+                    };
+                }>;
+                for (let idx = 0; idx < typedItems.length; idx++) {
+                    const item = typedItems[idx];
+                    const adjustedMeal = adjustedMeals[idx];
+                    item.serving_size = adjustedMeal?.weight_grams ?? Math.round(item.serving_size * scaleFactor);
+                    item.calories = adjustedMeal?.calories ?? Math.round(item.calories * scaleFactor);
+                    if (item.custom_food && adjustedMeal) {
+                        item.custom_food.calories_kcal = adjustedMeal.calories;
+                        item.custom_food.protein_g = adjustedMeal.protein;
+                        item.custom_food.carbs_g = adjustedMeal.carbs;
+                        item.custom_food.fat_g = adjustedMeal.fat;
+                        item.custom_food.serving_description = `${adjustedMeal.weight_grams}g`;
+                    }
                 }
                 dayPlan = {
                     ...dayPlan,
@@ -462,6 +548,12 @@ export class MealPlanGeneratorService {
             });
         }
 
+        if (days.length !== req.duration_days) {
+            await MealPlanItem.deleteMany({ meal_plan_id: plan._id });
+            await MealPlan.deleteOne({ _id: plan._id });
+            throw new Error(`Chưa tạo đủ kế hoạch ${req.duration_days} ngày (${days.length}/${req.duration_days}). Vui lòng thử lại.`);
+        }
+
         // Queue recipe enrichment for all recipes used in this plan
         if (recipeIdsForEnrichment.size > 0) {
             this.enrichment
@@ -494,7 +586,7 @@ export class MealPlanGeneratorService {
     ): Promise<GenerateDayResult> {
         const mealTypeTargets: Record<string, number> = {};
         // Value: { source_id, source_type, fdc_id }; keyed by both plain name and name+portionHint
-        const foodLookup = new Map<string, { source_id: string; source_type: "food" | "recipe" | "usda"; fdc_id?: number }>();
+        const foodLookup = new Map<string, { source_id: string; source_type: "food" | "recipe" | "usda" | "ai_generated"; fdc_id?: number }>();
         const mealTypeCandidates: MealTypeCandidates = new Map();
         // candidate strings per meal type (name + optional portion hint)
         const candidatesByMeal: Record<string, string> = {};
@@ -503,6 +595,7 @@ export class MealPlanGeneratorService {
         const cookingHint = req.cooking_style === "batch" ? "batch-cook one-pot reheat" : "fresh quick-prep";
         // Use override if a protein streak was detected on the previous day; otherwise rotate normally
         const proteinHint = overrideProteinHint ?? PROTEIN_ROTATIONS[(day - 1) % PROTEIN_ROTATIONS.length];
+        const allergyTerms = this._buildAllergyTerms(req.preferences?.allergies);
 
         const searchResults = await Promise.all(
             mealConfig.types.map((mealType) => {
@@ -513,14 +606,19 @@ export class MealPlanGeneratorService {
                     top_k: 8,
                     include_sources: ["food", "recipe", "usda"],
                     user_preferences: req.preferences as import("./FoodSearchService").UserPreferences | undefined,
-                }).then((results) => ({ mealType, results }));
+                }).then((results) => ({
+                    mealType,
+                    results: results.filter((r) => !this._containsBlockedAllergen(r.name, allergyTerms)),
+                }));
             }),
         );
 
-        // P0-5: Check if ALL meal types have 0 candidates
+        // P0-5: Check if ALL meal types have 0 verified candidates. We keep
+        // generation alive with starter candidates below so early/dev DBs do not
+        // make the core meal-plan feature feel broken.
         const allEmpty = searchResults.every(({ results }) => results.length === 0);
         if (allEmpty) {
-            throw new Error(`Day ${day}: ALL meal types have 0 candidates from vector search. Vector store may be empty.`);
+            console.warn(`[MealPlanGenerator] Day ${day}: all vector candidates empty — using starter AI-generated candidates.`);
         }
 
         for (const { mealType, results } of searchResults) {
@@ -553,6 +651,22 @@ export class MealPlanGeneratorService {
                     fiber: (r as any).fiber,
                 });
                 candidateNames.push(r.name + portionHint);
+            }
+
+            if (typedCandidates.length === 0) {
+                const starterCandidates = this._starterCandidatesForMeal(mealType, req, allergyTerms);
+                for (const starter of starterCandidates) {
+                    foodLookup.set(starter.name.toLowerCase(), {
+                        source_id: starter.source_id,
+                        source_type: starter.source_type,
+                    });
+                    foodLookup.set(`${starter.name} [ước tính]`.toLowerCase(), {
+                        source_id: starter.source_id,
+                        source_type: starter.source_type,
+                    });
+                    typedCandidates.push(starter);
+                    candidateNames.push(`${starter.name} [ước tính]`);
+                }
             }
 
             candidatesByMeal[mealType] = candidateNames.join("; ");
@@ -602,6 +716,7 @@ export class MealPlanGeneratorService {
                             for (let i = 0; i < fsItems.length; i++) {
                                 const fs     = fsItems[i];
                                 const viName = viNames[i] || fs.food_name;
+                                if (this._containsBlockedAllergen(`${viName} ${fs.food_name}`, allergyTerms)) continue;
                                 // Upsert synchronously so we get a real MongoDB _id
                                 const food = await fsImport.upsertFromV5Food(fs, viName);
                                 if (!food) continue;
@@ -640,6 +755,8 @@ export class MealPlanGeneratorService {
             : "Nấu tươi từng bữa";
         const dietaryLine = req.preferences?.dietary_preference
             ? `\n- Chế độ ăn: ${req.preferences.dietary_preference}` : "";
+        const allergyLine = req.preferences?.allergies?.length
+            ? `\n- Dị ứng/kiêng bắt buộc: ${req.preferences.allergies.join(", ")}` : "";
         const notesLine = req.preferences?.notes
             ? `\n- Ghi chú: ${req.preferences.notes}` : "";
         // Pass the full recent-names window (up to 60) so the LLM avoids repeating items
@@ -652,7 +769,7 @@ export class MealPlanGeneratorService {
 
         const bioline = userBio ? `\nNgười dùng: ${userBio}` : "";
         const prompt = `== Kế hoạch bữa ăn: Ngày ${day}/${req.duration_days} ==${bioline}
-Mục tiêu: ${GOAL_LABELS[req.goal]} · ${cookingStyleLabel}${dietaryLine}${notesLine}
+Mục tiêu: ${GOAL_LABELS[req.goal]} · ${cookingStyleLabel}${dietaryLine}${allergyLine}${notesLine}
 
 Chỉ tiêu ngày: ${targets.calories}kcal | P:${targets.protein}g | C:${targets.carbs}g | F:${targets.fat}g
 Bữa ăn: ${mealConfig.types.join(", ")}
@@ -670,7 +787,8 @@ QUY TẮC BẮT BUỘC:
    · dinner: 2–3 món (cơm + protein + canh/rau — lặp meal_type để thêm)
 4. cooking_steps: 2–4 bước nấu ngắn gọn thực tế bằng tiếng Việt
 5. Tổng calories mỗi bữa ±20% mục tiêu
-6. Đa dạng nguồn protein, không lặp cùng loại đạm trong ngày${avoidLine}
+6. Đa dạng nguồn protein, không lặp cùng loại đạm trong ngày
+7. TUYỆT ĐỐI không chọn món chứa dị ứng/kiêng bắt buộc của người dùng${avoidLine}
 
 Ví dụ JSON hợp lệ:
 {"meals":[
@@ -730,6 +848,11 @@ Trả về JSON hợp lệ (không markdown, không giải thích):`;
                 : m;
         });
 
+        const unsafeMeal = correctedMeals.find((m) => this._containsBlockedAllergen(m.food_name, allergyTerms));
+        if (unsafeMeal) {
+            throw new Error(`Day ${day}: meal "${unsafeMeal.food_name}" violates allergy constraints — retrying`);
+        }
+
         const dayTotals = correctedMeals.reduce(
             (acc, m) => ({
                 calories: acc.calories + m.calories,
@@ -778,6 +901,108 @@ Trả về JSON hợp lệ (không markdown, không giải thích):`;
         return { plan, mealTypeCandidates };
     }
 
+    private _uniqueStrings(values: Array<string | undefined | null>): string[] {
+        const seen = new Set<string>();
+        const result: string[] = [];
+        for (const value of values) {
+            const cleaned = typeof value === "string" ? value.trim() : "";
+            if (!cleaned) continue;
+            const key = this._normalizeText(cleaned);
+            if (seen.has(key)) continue;
+            seen.add(key);
+            result.push(cleaned);
+        }
+        return result;
+    }
+
+    private _normalizeText(value: string): string {
+        return value
+            .toLowerCase()
+            .normalize("NFD")
+            .replace(/[\u0300-\u036f]/g, "")
+            .replace(/đ/g, "d")
+            .replace(/[^\p{L}\p{N}\s]/gu, " ")
+            .replace(/\s+/g, " ")
+            .trim();
+    }
+
+    private _buildAllergyTerms(allergies?: string[]): string[] {
+        if (!allergies?.length) return [];
+        const aliasGroups: string[][] = [
+            ["peanut", "lac", "dau phong", "đậu phộng", "lạc"],
+            ["seafood", "hai san", "hải sản", "tom", "tôm", "cua", "crab", "muc", "mực", "squid", "ngheu", "nghêu", "so", "sò", "hau", "hàu"],
+            ["fish", "ca", "cá", "salmon", "tuna"],
+            ["shrimp", "tom", "tôm"],
+            ["crab", "cua"],
+            ["egg", "trung", "trứng"],
+            ["milk", "sua", "sữa", "dairy", "phomai", "pho mai", "cheese", "yogurt", "sua chua", "sữa chua"],
+            ["soy", "dau nanh", "đậu nành", "tofu", "dau hu", "đậu hũ", "dau phu", "đậu phụ"],
+            ["gluten", "wheat", "bot mi", "bột mì", "banh mi", "bánh mì", "mi", "mì"],
+            ["beef", "bo", "bò"],
+            ["pork", "heo", "lợn", "lon", "thit heo", "thịt heo"],
+            ["chicken", "ga", "gà"],
+            ["nuts", "hat", "hạt", "cashew", "hat dieu", "hạt điều", "almond", "hanh nhan", "hạnh nhân"],
+        ];
+
+        const normalizedAllergies = allergies.map((a) => this._normalizeText(a)).filter(Boolean);
+        const terms = new Set<string>(normalizedAllergies);
+        for (const allergy of normalizedAllergies) {
+            for (const group of aliasGroups) {
+                const normalizedGroup = group.map((term) => this._normalizeText(term));
+                if (normalizedGroup.some((term) => allergy.includes(term) || term.includes(allergy))) {
+                    normalizedGroup.forEach((term) => terms.add(term));
+                }
+            }
+        }
+        return [...terms].filter((term) => term.length >= 2);
+    }
+
+    private _containsBlockedAllergen(name: string | undefined, allergyTerms: string[]): boolean {
+        if (!name || allergyTerms.length === 0) return false;
+        const normalized = ` ${this._normalizeText(name)} `;
+        return allergyTerms.some((term) => normalized.includes(` ${term} `));
+    }
+
+    private _starterCandidatesForMeal(
+        mealType: string,
+        req: GenerateMealPlanRequest,
+        allergyTerms: string[],
+    ): CandidateEntry[] {
+        const key = mealType.includes("snack") ? "snack" : mealType;
+        const candidates = STARTER_CANDIDATES[key] ?? STARTER_CANDIDATES.snack;
+        const diet = req.preferences?.dietary_preference;
+        return candidates
+            .filter((c) => !this._containsBlockedAllergen(c.name, allergyTerms))
+            .filter((c) => this._isDietCompatible(c.name, diet))
+            .slice(0, 8);
+    }
+
+    private _isDietCompatible(name: string, diet?: string): boolean {
+        if (!diet || diet === "omnivore") return true;
+        const normalized = this._normalizeText(name);
+        const meatTerms = ["ga", "bo", "heo", "lon", "thit", "ca", "tom", "cua", "muc", "hai san", "pork", "beef", "chicken", "fish", "shrimp"];
+        const animalTerms = [...meatTerms, "trung", "sua", "sua chua", "pho mai", "egg", "milk", "yogurt", "cheese"];
+        if (diet === "vegan") return !animalTerms.some((term) => normalized.includes(term));
+        if (diet === "vegetarian") return !meatTerms.some((term) => normalized.includes(term));
+        if (diet === "pescatarian") {
+            const landMeatTerms = ["ga", "bo", "heo", "lon", "thit", "pork", "beef", "chicken"];
+            return !landMeatTerms.some((term) => normalized.includes(term));
+        }
+        return true;
+    }
+
+    private _toCustomFood(meal: MealItem) {
+        return {
+            name: meal.food_name.replace(/\s*\[.*?\]$/, "").trim(),
+            calories_kcal: meal.calories,
+            protein_g: meal.protein,
+            carbs_g: meal.carbs,
+            fat_g: meal.fat,
+            serving_description: `${meal.weight_grams}g`,
+            description: "Ước tính bởi CaloVie để tạo bản nháp thực đơn khi dữ liệu món ăn chưa đủ.",
+        };
+    }
+
     // Mifflin-St Jeor TDEE. Returns null if required profile fields are missing.
     private _calculateTDEE(prefs: {
         weight_kg?: number;
@@ -815,14 +1040,18 @@ Trả về JSON hợp lệ (không markdown, không giải thích):`;
         }
         if (deviation <= CAL_TOLERANCE) return { meals, scaleFactor: 1 };
 
-        const scaleFactor = targets.calories / (totalCal || 1);
+        const rawScaleFactor = targets.calories / (totalCal || 1);
+        const scaleFactor = Math.max(0.6, Math.min(1.8, rawScaleFactor));
+        if (scaleFactor !== rawScaleFactor) {
+            console.warn(`[MealPlanAudit] Day ${day}: requested scale ×${rawScaleFactor.toFixed(3)} clamped to ×${scaleFactor.toFixed(3)} to avoid unrealistic portions`);
+        }
         console.log(`[MealPlanAudit] Day ${day}: scaling ×${scaleFactor.toFixed(3)} (${totalCal}→${targets.calories} kcal, ${(deviation * 100).toFixed(0)}% off)`);
 
         return {
             scaleFactor,
             meals: meals.map((m) => ({
                 ...m,
-                weight_grams: Math.round(m.weight_grams * scaleFactor),
+                weight_grams: Math.round(Math.max(20, Math.min(1500, m.weight_grams * scaleFactor))),
                 calories:     Math.round(m.calories     * scaleFactor),
                 protein:      Math.round(m.protein      * scaleFactor * 10) / 10,
                 carbs:        Math.round(m.carbs         * scaleFactor * 10) / 10,
@@ -867,7 +1096,7 @@ Trả về JSON hợp lệ (không markdown, không giải thích):`;
         for (const mealType of ["dinner", "afternoon_snack", "snack"] as const) {
             const candidates = mealTypeCandidates.get(mealType) ?? [];
             const sorted = [...candidates]
-                .filter((c) => (c.fiber ?? 0) >= 2 && !usedIds.has(c.source_id))
+                .filter((c) => c.source_type !== "ai_generated" && (c.fiber ?? 0) >= 2 && !usedIds.has(c.source_id))
                 .sort((a, b) => (b.fiber ?? 0) - (a.fiber ?? 0));
             if (sorted.length > 0) {
                 // Only auto-add if current day's fiber looks low — heuristic: no candidate in existing meals has fiber data

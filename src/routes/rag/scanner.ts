@@ -1,6 +1,6 @@
 import { Router, Request, Response } from "express";
 import multer from "multer";
-import { optionalAuthenticate } from "../../middleware/auth";
+import { authenticate } from "../../middleware/auth";
 import { ragRateLimit } from "../../middleware/ragRateLimit";
 import { getScannerService, ScanMatch } from "../../services/rag/ScannerService";
 import { IUser } from "../../models/User";
@@ -37,13 +37,45 @@ function toClientMatch(m: ScanMatch) {
     };
 }
 
-router.post("/", optionalAuthenticate, ragRateLimit("scan"), upload.single("image"), async (req: Request, res: Response) => {
+function looksLikeSupportedImage(buffer: Buffer, mimeType: string): boolean {
+    const isJpeg = buffer.length > 3 &&
+        buffer[0] === 0xff &&
+        buffer[1] === 0xd8 &&
+        buffer[2] === 0xff;
+    const isPng = buffer.length > 8 &&
+        buffer[0] === 0x89 &&
+        buffer[1] === 0x50 &&
+        buffer[2] === 0x4e &&
+        buffer[3] === 0x47;
+    const isGif = buffer.length > 6 &&
+        buffer.subarray(0, 3).toString("ascii") === "GIF";
+    const isWebp = buffer.length > 12 &&
+        buffer.subarray(0, 4).toString("ascii") === "RIFF" &&
+        buffer.subarray(8, 12).toString("ascii") === "WEBP";
+    const isHeifFamily = buffer.length > 12 &&
+        buffer.subarray(4, 8).toString("ascii") === "ftyp" &&
+        ["image/heic", "image/heif", "image/heic-sequence", "image/heif-sequence"].includes(mimeType);
+
+    return isJpeg || isPng || isGif || isWebp || isHeifFamily;
+}
+
+function clampServingGrams(value?: number): number | undefined {
+    if (!Number.isFinite(value)) return undefined;
+    return Math.round(Math.max(20, Math.min(1500, value as number)));
+}
+
+router.post("/", authenticate, ragRateLimit("scan"), upload.single("image"), async (req: Request, res: Response) => {
     if (!req.file) {
         res.status(400).json({ error: "No image file provided" });
         return;
     }
 
-    const user = req.user as IUser | undefined;
+    if (!looksLikeSupportedImage(req.file.buffer, req.file.mimetype)) {
+        res.status(400).json({ error: "File ảnh không hợp lệ. Vui lòng chọn ảnh JPG, PNG, WEBP hoặc HEIC." });
+        return;
+    }
+
+    const user = req.user as IUser;
     const imageBase64 = req.file.buffer.toString("base64");
     const mimeType = req.file.mimetype;
     const t0 = Date.now();
@@ -55,6 +87,19 @@ router.post("/", optionalAuthenticate, ragRateLimit("scan"), upload.single("imag
             mimeType,
             userId: user?._id?.toString(),
         });
+
+        if (result.vision.not_food) {
+            logRag({
+                endpoint: "scan",
+                userId: user?._id?.toString(),
+                latency_ms: Date.now() - t0,
+                matched: false,
+                fallback_used: false,
+                status: "not_food",
+            });
+            res.status(422).json({ error: "Ảnh này có vẻ không phải món ăn. Bạn thử chụp rõ phần đồ ăn hơn nhé." });
+            return;
+        }
 
         // Primary match exists and is a real DB record (not AI estimate)
         const matched = !!result.primary_match &&
@@ -90,9 +135,11 @@ router.post("/", optionalAuthenticate, ragRateLimit("scan"), upload.single("imag
             match,
             description: result.vision.main_dish_vi || result.vision.main_dish_en,
             ai_estimate,
+            confidence: result.primary_match?.confidence ?? result.vision.confidence,
+            alternatives: result.alternatives.map(toClientMatch),
             serving_grams:
-                result.primary_match?.estimated_portion_grams ??
-                result.vision.estimated_portion_grams,
+                clampServingGrams(result.primary_match?.estimated_portion_grams) ??
+                clampServingGrams(result.vision.estimated_portion_grams),
         });
     } catch (err) {
         const msg = err instanceof Error ? err.message : "Scan failed";

@@ -12,6 +12,13 @@ const router = Router();
 const STORE_PRO_PRICE        = 49000;
 const STORE_MENU_LIMIT_BASIC = 20;
 const STORE_LIMIT_BASIC      = 1; // basic owners may have only 1 store
+const STORE_PRO_DURATIONS    = [1, 3, 6, 12] as const;
+const STORE_PRO_DURATION_DISCOUNT_PCT: Record<number, number> = {
+    1: 0,
+    3: 5,
+    6: 10,
+    12: 15,
+};
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -134,6 +141,63 @@ function decorateStore(store: any, user?: IUser, distance_km?: number) {
         match_reasons,
         price_range: getPriceRange(plain),
         ...(distance_km !== undefined ? { distance_km: Number(distance_km.toFixed(2)) } : {}),
+    };
+}
+
+function normalizeStoreProDuration(value: unknown): number {
+    const months = Number(value ?? 1);
+    if (!Number.isInteger(months) || !STORE_PRO_DURATIONS.includes(months as typeof STORE_PRO_DURATIONS[number])) {
+        throw new Error("invalid_duration");
+    }
+    return months;
+}
+
+function normalizeStorePaymentMethod(value: unknown): "bank_transfer" | "momo" {
+    const method = String(value || "bank_transfer");
+    if (method !== "bank_transfer" && method !== "momo") {
+        throw new Error("invalid_payment_method");
+    }
+    return method;
+}
+
+function buildStoreProQuote(durationMonths: number) {
+    const amount = STORE_PRO_PRICE * durationMonths;
+    const discountPct = STORE_PRO_DURATION_DISCOUNT_PCT[durationMonths] ?? 0;
+    const finalAmount = Math.max(0, Math.round(amount * (1 - discountPct / 100)));
+    return {
+        plan_type: "store_pro" as const,
+        duration_months: durationMonths,
+        price_monthly: STORE_PRO_PRICE,
+        amount,
+        final_amount: finalAmount,
+        duration_discount_pct: discountPct,
+        duration_discount_amount: amount - finalAmount,
+        currency: "VND",
+    };
+}
+
+function getStorePaymentInstructions(method: "bank_transfer" | "momo", amount: number, ref: string) {
+    const formatted = amount.toLocaleString("vi-VN");
+    if (method === "momo") {
+        const phone = process.env.PAYMENT_MOMO_PHONE || "0912345678";
+        return {
+            method: "MoMo",
+            phone,
+            amount: formatted,
+            note: ref,
+            message: `Chuyển ${formatted}₫ qua MoMo đến ${phone} nội dung: ${ref}`,
+        };
+    }
+    const account = process.env.PAYMENT_BANK_ACCOUNT || "1234567890";
+    const bank = process.env.PAYMENT_BANK_NAME || "Vietcombank";
+    return {
+        method: "Chuyển khoản ngân hàng",
+        bank,
+        account,
+        owner: process.env.PAYMENT_BANK_OWNER || "CALOVIE",
+        amount: formatted,
+        note: ref,
+        message: `Chuyển ${formatted}₫ tới TK ${account} (${bank}) nội dung: ${ref}`,
     };
 }
 
@@ -657,6 +721,24 @@ router.get("/:id/analytics/export", authenticate, async (req: Request, res: Resp
 
 // ── Store Pro upgrade ─────────────────────────────────────────────────────────
 
+router.post("/:id/upgrade/quote", authenticate, async (req: Request, res: Response) => {
+    try {
+        const user  = req.user as IUser;
+        const store = await Store.findById(req.params.id);
+        if (!ownerStoreOrFail(store, user, res)) return;
+
+        const durationMonths = normalizeStoreProDuration(req.body.duration_months);
+        res.json(buildStoreProQuote(durationMonths));
+    } catch (error) {
+        const message = (error as Error).message;
+        if (message === "invalid_duration") {
+            res.status(400).json({ error: "invalid_duration", message: "Thời hạn gói chỉ hỗ trợ 1, 3, 6 hoặc 12 tháng." });
+            return;
+        }
+        res.status(500).json({ error: message });
+    }
+});
+
 router.post("/:id/upgrade", authenticate, async (req: Request, res: Response) => {
     try {
         const user  = req.user as IUser;
@@ -666,37 +748,75 @@ router.post("/:id/upgrade", authenticate, async (req: Request, res: Response) =>
             res.status(403).json({ error: "Forbidden" }); return;
         }
 
-        const { duration_months = 1, payment_method } = req.body;
-        const amount = STORE_PRO_PRICE * duration_months;
+        const durationMonths = normalizeStoreProDuration(req.body.duration_months);
+        const paymentMethod = normalizeStorePaymentMethod(req.body.payment_method);
+        const quote = buildStoreProQuote(durationMonths);
+
+        const twoHoursAgo = new Date(Date.now() - 2 * 60 * 60 * 1000);
+        const existingPending = await PaymentTransaction.findOne({
+            user_id:        (user as any)._id,
+            plan_type:      "store_pro",
+            target_type:    "store",
+            store_id:       store._id,
+            duration_months: durationMonths,
+            status:         "pending",
+            created_at:     { $gte: twoHoursAgo },
+        }).sort({ created_at: -1 });
+
+        if (existingPending) {
+            const ref = `STORE${String(existingPending._id).slice(-8).toUpperCase()}`;
+            res.status(409).json({
+                error: "pending_transaction_exists",
+                message: "Quán đã có giao dịch Store Pro đang chờ thanh toán.",
+                transaction_id: existingPending._id,
+                store_id:       store._id,
+                amount:         existingPending.amount,
+                final_amount:   existingPending.final_amount,
+                status:         existingPending.status,
+                payment_method: existingPending.payment_method || paymentMethod,
+                payment_instructions: getStorePaymentInstructions(
+                    (existingPending.payment_method as "bank_transfer" | "momo") || paymentMethod,
+                    existingPending.final_amount,
+                    ref,
+                ),
+            });
+            return;
+        }
 
         const tx = await PaymentTransaction.create({
             user_id:        (user as any)._id,
             plan_type:      "store_pro",
             target_type:    "store",
             store_id:       store._id,
-            duration_months,
-            amount,
-            final_amount:   amount,
+            duration_months: durationMonths,
+            amount:         quote.amount,
+            final_amount:   quote.final_amount,
             status:         "pending",
-            payment_method: payment_method || undefined,
+            payment_method: paymentMethod,
         });
 
         const ref = `STORE${String(tx._id).slice(-8).toUpperCase()}`;
         res.status(201).json({
             transaction_id: tx._id,
             store_id:       store._id,
-            amount,
-            final_amount:   amount,
+            amount:         quote.amount,
+            final_amount:   quote.final_amount,
             status:         "pending",
-            payment_instructions: {
-                method:  payment_method || "bank_transfer",
-                amount:  amount.toLocaleString("vi-VN"),
-                note:    ref,
-                message: `Chuyển ${amount.toLocaleString("vi-VN")}₫ với nội dung: ${ref}`,
-            },
+            payment_method: paymentMethod,
+            payment_instructions: getStorePaymentInstructions(paymentMethod, quote.final_amount, ref),
+            quote,
         });
     } catch (error) {
-        res.status(500).json({ error: (error as Error).message });
+        const message = (error as Error).message;
+        if (message === "invalid_duration") {
+            res.status(400).json({ error: "invalid_duration", message: "Thời hạn gói chỉ hỗ trợ 1, 3, 6 hoặc 12 tháng." });
+            return;
+        }
+        if (message === "invalid_payment_method") {
+            res.status(400).json({ error: "invalid_payment_method", message: "Phương thức thanh toán không hợp lệ." });
+            return;
+        }
+        res.status(500).json({ error: message });
     }
 });
 
@@ -706,6 +826,9 @@ router.post("/:id/confirm-upgrade", authenticate, requireAdmin, async (req: Requ
         const tx = await PaymentTransaction.findById(tx_id);
         if (!tx || tx.plan_type !== "store_pro" || tx.target_type !== "store") {
             res.status(404).json({ error: "Transaction not found" }); return;
+        }
+        if (tx.status !== "pending") {
+            res.status(400).json({ error: "Transaction is not pending" }); return;
         }
         tx.status      = "completed";
         tx.payment_ref = req.body.payment_ref || undefined;
