@@ -44,6 +44,33 @@ function requiredAppleConfig() {
     return { clientId, teamId, keyId, privateKey };
 }
 
+function appleTokenEncryptionKey(): Buffer {
+    const value = process.env.APPLE_TOKEN_ENCRYPTION_KEY;
+    const key = value ? Buffer.from(value, "base64") : Buffer.alloc(0);
+    if (key.length !== 32) {
+        throw new NativeIdentityError("APPLE_TOKEN_ENCRYPTION_KEY must be a base64-encoded 32-byte key.", 503);
+    }
+    return key;
+}
+
+export function encryptAppleRefreshToken(token: string): string {
+    const iv = crypto.randomBytes(12);
+    const cipher = crypto.createCipheriv("aes-256-gcm", appleTokenEncryptionKey(), iv);
+    const encrypted = Buffer.concat([cipher.update(token, "utf8"), cipher.final()]);
+    const tag = cipher.getAuthTag();
+    return `v1.${iv.toString("base64")}.${tag.toString("base64")}.${encrypted.toString("base64")}`;
+}
+
+export function decryptAppleRefreshToken(value?: string): string | undefined {
+    if (!value) return undefined;
+    if (!value.startsWith("v1.")) return value;
+    const [, ivValue, tagValue, encryptedValue] = value.split(".");
+    if (!ivValue || !tagValue || !encryptedValue) throw new NativeIdentityError("Stored Apple token is malformed.", 500);
+    const decipher = crypto.createDecipheriv("aes-256-gcm", appleTokenEncryptionKey(), Buffer.from(ivValue, "base64"));
+    decipher.setAuthTag(Buffer.from(tagValue, "base64"));
+    return Buffer.concat([decipher.update(Buffer.from(encryptedValue, "base64")), decipher.final()]).toString("utf8");
+}
+
 async function createAppleClientSecret(): Promise<{ clientId: string; clientSecret: string }> {
     const { clientId, teamId, keyId, privateKey } = requiredAppleConfig();
     const clientSecret = jwt.sign({}, privateKey, {
@@ -164,11 +191,12 @@ export async function exchangeAppleAuthorizationCode(code: string): Promise<stri
 export async function revokeAppleRefreshToken(refreshToken?: string): Promise<void> {
     if (!refreshToken) return;
     try {
+        const decryptedToken = decryptAppleRefreshToken(refreshToken);
         const { clientId, clientSecret } = await createAppleClientSecret();
         const body = new URLSearchParams({
             client_id: clientId,
             client_secret: clientSecret,
-            token: refreshToken,
+            token: decryptedToken!,
             token_type_hint: "refresh_token",
         });
         await axios.post(`${APPLE_ISSUER}/auth/revoke`, body.toString(), {

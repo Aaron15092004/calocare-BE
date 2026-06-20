@@ -24,6 +24,7 @@ import { authenticate } from "../middleware/auth";
 import { downgradeExpiredUserSubscription } from "../utils/subscriptionEntitlements";
 import {
     exchangeAppleAuthorizationCode,
+    encryptAppleRefreshToken,
     NativeIdentityError,
     revokeAppleRefreshToken,
     verifyNativeAppleIdentity,
@@ -214,17 +215,18 @@ router.post("/native/apple", authLimiter, async (req: Request, res: Response) =>
 
         const authorizationCode = typeof req.body.authorization_code === "string" ? req.body.authorization_code : "";
         const refreshToken = await exchangeAppleAuthorizationCode(authorizationCode);
+        const encryptedAppleRefreshToken = refreshToken ? encryptAppleRefreshToken(refreshToken) : undefined;
         if (user) {
             if (user.is_banned) { res.status(403).json({ error: "Account is banned" }); return; }
             let changed = false;
             if (!user.apple_id) { user.apple_id = identity.subject; changed = true; }
-            if (refreshToken) { user.apple_refresh_token = refreshToken; changed = true; }
+            if (encryptedAppleRefreshToken) { user.apple_refresh_token = encryptedAppleRefreshToken; changed = true; }
             if (changed) await user.save();
         } else {
             user = await User.create({
                 email: identity.email!,
                 apple_id: identity.subject,
-                apple_refresh_token: refreshToken,
+                apple_refresh_token: encryptedAppleRefreshToken,
                 display_name: providedName || identity.email!.split("@")[0],
             });
         }
