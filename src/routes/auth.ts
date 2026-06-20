@@ -18,9 +18,17 @@ import Store from "../models/Store";
 import Recipe from "../models/Recipe";
 import Food from "../models/Food";
 import EnrichmentQueue from "../models/EnrichmentQueue";
+import FamilyGroup from "../models/FamilyGroup";
 import { generateAccessToken, generateRefreshToken, verifyRefreshToken } from "../utils/jwt";
 import { authenticate } from "../middleware/auth";
 import { downgradeExpiredUserSubscription } from "../utils/subscriptionEntitlements";
+import {
+    exchangeAppleAuthorizationCode,
+    NativeIdentityError,
+    revokeAppleRefreshToken,
+    verifyNativeAppleIdentity,
+    verifyNativeGoogleIdentity,
+} from "../services/nativeIdentityService";
 
 const router = Router();
 
@@ -67,10 +75,43 @@ function userObjectId(id: string) {
     return User.db.base.Types.ObjectId.createFromHexString(id);
 }
 
+function serializeUser(user: IUser) {
+    return {
+        id: user._id,
+        email: user.email,
+        display_name: user.display_name,
+        avatar_url: user.avatar_url,
+        role: user.role,
+        subscription_tier: user.subscription_tier,
+        subscription_expires_at: user.subscription_expires_at ?? null,
+        is_banned: user.is_banned,
+        language: user.language,
+        daily_nutrition_goals: user.daily_nutrition_goals,
+        preferences: user.preferences,
+        onboarding_completed: Boolean((user.preferences as Record<string, unknown>)?.onboarding_completed),
+        created_at: user.created_at,
+    };
+}
+
+async function createAuthSession(user: IUser) {
+    await downgradeExpiredUserSubscription(user);
+    const accessToken = generateAccessToken(user._id.toString());
+    const refreshToken = generateRefreshToken(user._id.toString());
+    await User.findByIdAndUpdate(user._id, { $push: { refresh_tokens: refreshToken } });
+    return {
+        access_token: accessToken,
+        refresh_token: refreshToken,
+        user: serializeUser(user),
+    };
+}
+
 // POST /api/auth/register
 router.post("/register", authLimiter, async (req: Request, res: Response) => {
     try {
-        const { email, password, display_name } = req.body;
+        const { email, password } = req.body;
+        const display_name = typeof req.body.display_name === "string"
+            ? req.body.display_name.trim()
+            : typeof req.body.full_name === "string" ? req.body.full_name.trim() : "";
         if (!email || !password || !display_name) {
             res.status(400).json({ error: "email, password, and display_name are required" });
             return;
@@ -81,26 +122,7 @@ router.post("/register", authLimiter, async (req: Request, res: Response) => {
             return;
         }
         const user = await User.create({ email, password, display_name });
-        const accessToken = generateAccessToken(user._id.toString());
-        const refreshToken = generateRefreshToken(user._id.toString());
-        await User.findByIdAndUpdate(user._id, { $push: { refresh_tokens: refreshToken } });
-
-        res.status(201).json({
-            access_token: accessToken,
-            refresh_token: refreshToken,
-            user: {
-                id: user._id,
-                email: user.email,
-                display_name: user.display_name,
-                avatar_url: user.avatar_url,
-                role: user.role,
-                subscription_tier: user.subscription_tier,
-                subscription_expires_at: user.subscription_expires_at ?? null,
-                language: user.language,
-                daily_nutrition_goals: user.daily_nutrition_goals,
-                preferences: user.preferences,
-            },
-        });
+        res.status(201).json(await createAuthSession(user));
     } catch (error) {
         res.status(500).json({ error: (error as Error).message });
     }
@@ -123,30 +145,94 @@ router.post("/login", authLimiter, async (req: Request, res: Response) => {
             res.status(403).json({ error: "Account is banned" });
             return;
         }
-        await downgradeExpiredUserSubscription(user);
-
-        const accessToken = generateAccessToken(user._id.toString());
-        const refreshToken = generateRefreshToken(user._id.toString());
-        await User.findByIdAndUpdate(user._id, { $push: { refresh_tokens: refreshToken } });
-
-        res.json({
-            access_token: accessToken,
-            refresh_token: refreshToken,
-            user: {
-                id: user._id,
-                email: user.email,
-                display_name: user.display_name,
-                avatar_url: user.avatar_url,
-                role: user.role,
-                subscription_tier: user.subscription_tier,
-                subscription_expires_at: user.subscription_expires_at ?? null,
-                language: user.language,
-                daily_nutrition_goals: user.daily_nutrition_goals,
-                preferences: user.preferences,
-            },
-        });
+        res.json(await createAuthSession(user));
     } catch (error) {
         res.status(500).json({ error: (error as Error).message });
+    }
+});
+
+// Native social login verifies provider-issued ID tokens on the server. The app
+// never treats a locally decoded token as proof of identity.
+router.post("/native/google", authLimiter, async (req: Request, res: Response) => {
+    try {
+        const idToken = typeof req.body.id_token === "string" ? req.body.id_token : "";
+        if (!idToken) { res.status(400).json({ error: "id_token is required" }); return; }
+
+        const identity = await verifyNativeGoogleIdentity(idToken);
+        let user = await User.findOne({ google_id: identity.subject });
+        if (!user) {
+            user = await User.findOne({ email: identity.email });
+            if (user?.google_id && user.google_id !== identity.subject) {
+                res.status(409).json({ error: "google_account_conflict" });
+                return;
+            }
+        }
+
+        if (user) {
+            if (user.is_banned) { res.status(403).json({ error: "Account is banned" }); return; }
+            let changed = false;
+            if (!user.google_id) { user.google_id = identity.subject; changed = true; }
+            if (!user.avatar_url && identity.avatarUrl) { user.avatar_url = identity.avatarUrl; changed = true; }
+            if (changed) await user.save();
+        } else {
+            user = await User.create({
+                email: identity.email,
+                google_id: identity.subject,
+                display_name: identity.displayName || identity.email.split("@")[0],
+                avatar_url: identity.avatarUrl,
+            });
+        }
+
+        res.json(await createAuthSession(user));
+    } catch (error) {
+        const status = error instanceof NativeIdentityError ? error.status : 500;
+        res.status(status).json({ error: "native_google_login_failed", message: (error as Error).message });
+    }
+});
+
+router.post("/native/apple", authLimiter, async (req: Request, res: Response) => {
+    try {
+        const identityToken = typeof req.body.identity_token === "string" ? req.body.identity_token : "";
+        if (!identityToken) { res.status(400).json({ error: "identity_token is required" }); return; }
+
+        const identity = await verifyNativeAppleIdentity(identityToken);
+        const providedName = typeof req.body.display_name === "string"
+            ? req.body.display_name.trim()
+            : typeof req.body.full_name === "string" ? req.body.full_name.trim() : "";
+        let user = await User.findOne({ apple_id: identity.subject });
+        if (!user && identity.email) {
+            user = await User.findOne({ email: identity.email });
+            if (user?.apple_id && user.apple_id !== identity.subject) {
+                res.status(409).json({ error: "apple_account_conflict" });
+                return;
+            }
+        }
+        if (!user && !identity.email) {
+            res.status(400).json({ error: "apple_email_required", message: "Please share your email on the first Apple Sign In." });
+            return;
+        }
+
+        const authorizationCode = typeof req.body.authorization_code === "string" ? req.body.authorization_code : "";
+        const refreshToken = await exchangeAppleAuthorizationCode(authorizationCode);
+        if (user) {
+            if (user.is_banned) { res.status(403).json({ error: "Account is banned" }); return; }
+            let changed = false;
+            if (!user.apple_id) { user.apple_id = identity.subject; changed = true; }
+            if (refreshToken) { user.apple_refresh_token = refreshToken; changed = true; }
+            if (changed) await user.save();
+        } else {
+            user = await User.create({
+                email: identity.email!,
+                apple_id: identity.subject,
+                apple_refresh_token: refreshToken,
+                display_name: providedName || identity.email!.split("@")[0],
+            });
+        }
+
+        res.json(await createAuthSession(user));
+    } catch (error) {
+        const status = error instanceof NativeIdentityError ? error.status : 500;
+        res.status(status).json({ error: "native_apple_login_failed", message: (error as Error).message });
     }
 });
 
@@ -207,19 +293,23 @@ router.delete("/account", authenticate, async (req: Request, res: Response) => {
 
         const userId = user._id.toString();
         const userObjectIdValue = userObjectId(userId);
+        const deletingUser = await User.findById(userObjectIdValue).select("+apple_refresh_token");
 
-        const [ownedStores, ownedMealPlans, ownReviews, userMealPlans] = await Promise.all([
+        const [ownedStores, ownedMealPlans, ownReviews, userMealPlans, ownedFamilyGroups] = await Promise.all([
             Store.find({ owner_id: userObjectIdValue }).select("_id").lean(),
             MealPlan.find({ creator_id: userObjectIdValue }).select("_id").lean(),
             Review.find({ user_id: userObjectIdValue, is_deleted: false }).select("target_type target_id").lean(),
             UserMealPlan.find({ user_id: userObjectIdValue }).select("_id").lean(),
+            FamilyGroup.find({ owner_id: userObjectIdValue }).select("_id").lean(),
         ]);
 
         const ownedStoreIds = ownedStores.map((store) => store._id);
         const ownedMealPlanIds = ownedMealPlans.map((plan) => plan._id);
         const userMealPlanIds = userMealPlans.map((plan) => plan._id);
+        const ownedFamilyGroupIds = ownedFamilyGroups.map((group) => group._id);
 
         await Promise.all([
+            revokeAppleRefreshToken(deletingUser?.apple_refresh_token),
             ChatSession.deleteMany({ user_id: userObjectIdValue }),
             FoodDiary.deleteMany({ user_id: userObjectIdValue }),
             MealProgress.deleteMany({ user_id: userObjectIdValue }),
@@ -236,6 +326,15 @@ router.delete("/account", authenticate, async (req: Request, res: Response) => {
             MealPlan.deleteMany({ creator_id: userObjectIdValue }),
             Review.deleteMany({ target_type: "store", target_id: { $in: ownedStoreIds } }),
             Store.deleteMany({ owner_id: userObjectIdValue }),
+            FamilyGroup.updateMany({ "members.user_id": userObjectIdValue }, { $pull: { members: { user_id: userObjectIdValue } } }),
+            FamilyGroup.deleteMany({ owner_id: userObjectIdValue }),
+            User.updateMany(
+                { family_access_source: { $in: ownedFamilyGroupIds } },
+                {
+                    $set: { subscription_tier: "free" },
+                    $unset: { subscription_expires_at: "", family_group_id: "", family_role: "", family_access_source: "" },
+                },
+            ),
             Recipe.updateMany({ creator_id: userObjectIdValue }, { $unset: { creator_id: 1 } }),
             Food.updateMany({ creator_id: userObjectIdValue }, { $unset: { creator_id: 1 } }),
             User.findByIdAndDelete(userObjectIdValue),
@@ -284,20 +383,7 @@ router.get(
 // GET /api/auth/me
 router.get("/me", authenticate, (req: Request, res: Response) => {
     const user = req.user as IUser;
-    res.json({
-        id: user._id,
-        email: user.email,
-        display_name: user.display_name,
-        avatar_url: user.avatar_url,
-        role: user.role,
-        subscription_tier: user.subscription_tier,
-        subscription_expires_at: user.subscription_expires_at,
-        is_banned: user.is_banned,
-        language: user.language,
-        daily_nutrition_goals: user.daily_nutrition_goals,
-        preferences: user.preferences,
-        created_at: user.created_at,
-    });
+    res.json(serializeUser(user));
 });
 
 export default router;

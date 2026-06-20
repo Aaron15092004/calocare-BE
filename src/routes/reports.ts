@@ -6,6 +6,7 @@ import ReportDigest, { IReportDigestContent } from "../models/ReportDigest";
 import { computeInsights } from "../services/ReportInsightService";
 import { getLLMService } from "../services/rag/LLMService";
 import { Types } from "mongoose";
+import { getEffectiveUserTier } from "../utils/subscriptionEntitlements";
 
 const router = Router();
 
@@ -140,7 +141,7 @@ router.post("/ai-digest", authenticate, async (req: Request, res: Response) => {
     try {
         const user = req.user as IUser;
 
-        if (user.subscription_tier === "free") {
+        if (getEffectiveUserTier(user.subscription_tier, user.subscription_expires_at) === "free") {
             res.status(403).json({ error: "Tính năng này yêu cầu gói Premium." });
             return;
         }

@@ -10,6 +10,13 @@ import SystemSettings from "../models/SystemSettings";
 import { sendPaymentConfirmed } from "../services/emailService";
 import { getEffectiveUserTier } from "../utils/subscriptionEntitlements";
 import { getClientUrl, getPayOS } from "../services/payosClient";
+import {
+    applyRevenueCatEvent,
+    RevenueCatConfigurationError,
+    RevenueCatEvent,
+    syncRevenueCatSubscriber,
+    verifyRevenueCatAuthorization,
+} from "../services/revenueCatService";
 
 // Returns the active global discount percentage (0 if none, expired, or plan not in applicable_plans)
 async function getGlobalDiscountPct(planType?: string): Promise<number> {
@@ -368,12 +375,10 @@ router.get("/plans", async (_req, res) => {
                     weekly_report: true,
                     family_members: 5,
                     separate_health_reports: true,
-                    expert_advice: true,
                     push_notifications: true,
                     progress_charts_months: null,
                     batch_scan: 3,
                     ai_nutritionist: true,
-                    dietitian_booking: true,
                     health_metrics: true,
                     api_access: true,
                     priority_support: "chat_2h",
@@ -800,13 +805,65 @@ router.get("/admin/pending", authenticate, requireAdmin, async (_req, res: Respo
     }
 });
 
-// ── IAP webhook (mobile u2192 server after RevenueCat purchase) ─────────────────
-// Called optimistically by the mobile app; real entitlement sync goes through
-// the RevenueCat server-to-server webhook configured in the RC dashboard.
+// RevenueCat is the source of truth for native subscriptions. Configure the same
+// authorization value in the RevenueCat webhook dashboard and server env.
+router.post("/webhook/revenuecat", async (req: Request, res: Response) => {
+    if (!process.env.REVENUECAT_WEBHOOK_AUTH) {
+        res.status(503).json({ error: "revenuecat_webhook_not_configured" });
+        return;
+    }
+    if (!verifyRevenueCatAuthorization(req.get("authorization") || req.get("x-revenuecat-webhook-token") || undefined)) {
+        res.status(401).json({ error: "invalid_revenuecat_webhook" });
+        return;
+    }
+
+    try {
+        const event = (req.body?.event || req.body) as RevenueCatEvent;
+        const user = await applyRevenueCatEvent(event);
+        res.json({ received: true, user_id: user?._id || null });
+    } catch (error) {
+        console.error("[subscription] RevenueCat webhook failed:", error);
+        res.status(500).json({ error: "revenuecat_webhook_failed" });
+    }
+});
+
+// The app can request an immediate server-side entitlement refresh after a
+// completed store purchase. This endpoint never accepts an entitlement from the client.
+router.post("/mobile/sync", authenticate, async (req: Request, res: Response) => {
+    try {
+        const user = await User.findById((req.user as IUser)._id).select(
+            "subscription_tier subscription_expires_at family_role family_access_source",
+        );
+        if (!user) { res.status(404).json({ error: "User not found" }); return; }
+
+        // Family members inherit access from the owner and must not be downgraded
+        // because they do not have a personal store subscription.
+        if (!(user.family_role === "member" && user.family_access_source)) {
+            await syncRevenueCatSubscriber(user._id.toString());
+        }
+
+        const refreshed = await User.findById(user._id).select("subscription_tier subscription_expires_at");
+        const tier = getEffectiveUserTier(refreshed?.subscription_tier, refreshed?.subscription_expires_at);
+        res.json({
+            tier,
+            expires_at: refreshed?.subscription_expires_at ?? null,
+            is_active: tier !== "free",
+        });
+    } catch (error) {
+        if (error instanceof RevenueCatConfigurationError) {
+            res.status(503).json({ error: "revenuecat_not_configured", message: error.message });
+            return;
+        }
+        res.status(502).json({ error: "revenuecat_sync_failed" });
+    }
+});
+
+// Kept as an explicit rejection so older app versions cannot self-upgrade by
+// posting a tier. They should upgrade to a version using /mobile/sync.
 router.post("/iap-webhook", authenticate, async (_req: Request, res: Response) => {
     res.status(410).json({
         error: "iap_client_sync_disabled",
-        message: "IAP entitlement changes must be verified by a server-to-server provider webhook.",
+        message: "IAP entitlement changes must be verified by RevenueCat server sync.",
     });
 });
 

@@ -13,6 +13,8 @@ export interface IUser extends Document {
     email: string;
     password?: string;
     google_id?: string;
+    apple_id?: string;
+    apple_refresh_token?: string;
     display_name: string;
     avatar_url?: string;
     role: "user" | "admin" | "moderator" | "store_owner";
@@ -37,6 +39,8 @@ const UserSchema = new Schema<IUser>(
         email: { type: String, required: true, unique: true, lowercase: true, trim: true },
         password: { type: String, select: false },
         google_id: { type: String, sparse: true },
+        apple_id: { type: String, sparse: true, unique: true },
+        apple_refresh_token: { type: String, select: false },
         display_name: { type: String, required: true, trim: true },
         avatar_url: { type: String },
         role: { type: String, enum: ["user", "admin", "moderator", "store_owner"], default: "user" },
