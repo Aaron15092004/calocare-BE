@@ -21,6 +21,38 @@ const STORE_PRO_DURATION_DISCOUNT_PCT: Record<number, number> = {
     12: 15,
 };
 
+const MENU_CATEGORIES = ["breakfast", "main", "snack", "drink", "dessert", "other"] as const;
+const DIETARY_TAGS = ["vegetarian", "vegan", "high_protein", "low_carb", "gluten_free", "dairy_free"] as const;
+const ALLERGEN_TAGS = ["milk", "egg", "peanut", "nuts", "shellfish", "seafood", "soy", "gluten"] as const;
+
+type MenuCategory = typeof MENU_CATEGORIES[number];
+type NutritionStatus = "not_provided" | "owner_provided" | "ai_estimated" | "admin_verified";
+
+interface MenuItemInput {
+    name_vi?: string;
+    name_en?: string;
+    price?: number;
+    description?: string;
+    ingredient_summary?: string;
+    image_url?: string;
+    menu_category?: MenuCategory;
+    serving_label?: string;
+    serving_weight_grams?: number;
+    search_keywords?: string[];
+    dietary_tags?: string[];
+    allergens?: string[];
+    energy_kcal?: number;
+    protein?: number;
+    lipid?: number;
+    glucid?: number;
+    fiber?: number;
+    nutrition_source_reference?: string;
+    nutrition_status?: NutritionStatus;
+    nutrition_verified?: boolean;
+    nutrition_updated_at?: Date;
+    is_available?: boolean;
+}
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 function isOwnerOrAdmin(user: IUser, ownerId: unknown): boolean {
@@ -41,6 +73,99 @@ function normalizeText(value: string): string {
 
 function escapeRegex(value: string): string {
     return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function optionalText(value: unknown, maxLength: number): string | undefined {
+    if (typeof value !== "string") return undefined;
+    const trimmed = value.trim();
+    return trimmed ? trimmed.slice(0, maxLength) : undefined;
+}
+
+function optionalNonNegativeNumber(value: unknown, field: string, errors: string[]): number | undefined {
+    if (value === undefined || value === null || value === "") return undefined;
+    const parsed = Number(value);
+    if (!Number.isFinite(parsed) || parsed < 0) {
+        errors.push(`${field} phải là số không âm.`);
+        return undefined;
+    }
+    return Math.round(parsed * 100) / 100;
+}
+
+function stringList(value: unknown, allowed: readonly string[], maxItems = 12): string[] | undefined {
+    if (value === undefined) return undefined;
+    const values = Array.isArray(value) ? value : String(value).split(",");
+    return [...new Set(values
+        .filter((entry): entry is string => typeof entry === "string")
+        .map((entry) => entry.trim().toLowerCase())
+        .filter((entry) => allowed.includes(entry)))]
+        .slice(0, maxItems);
+}
+
+function searchKeywords(value: unknown): string[] | undefined {
+    if (value === undefined) return undefined;
+    const values = Array.isArray(value) ? value : String(value).split(",");
+    return [...new Set(values
+        .filter((entry): entry is string => typeof entry === "string")
+        .map((entry) => entry.trim().toLocaleLowerCase("vi-VN"))
+        .filter(Boolean)
+        .map((entry) => entry.slice(0, 80)))]
+        .slice(0, 20);
+}
+
+export function buildMenuItemInput(
+    body: Record<string, unknown>,
+    options: { creating?: boolean; allowAdminVerification?: boolean } = {},
+): { data: MenuItemInput; errors: string[] } {
+    const errors: string[] = [];
+    const data: MenuItemInput = {};
+    const has = (field: string) => Object.prototype.hasOwnProperty.call(body, field);
+    const textFields: Array<[keyof MenuItemInput, number]> = [
+        ["name_vi", 120], ["name_en", 120], ["description", 1200], ["ingredient_summary", 1200],
+        ["image_url", 500], ["serving_label", 80], ["nutrition_source_reference", 240],
+    ];
+
+    for (const [field, maxLength] of textFields) {
+        if (has(field)) data[field] = optionalText(body[field], maxLength) as never;
+    }
+
+    if (options.creating && !data.name_vi) errors.push("Tên món tiếng Việt là bắt buộc.");
+    if (has("image_url") && data.image_url) {
+        try {
+            const url = new URL(data.image_url);
+            if (!/^https?:$/.test(url.protocol)) errors.push("URL ảnh phải bắt đầu bằng http hoặc https.");
+        } catch {
+            errors.push("URL ảnh không hợp lệ.");
+        }
+    }
+
+    for (const field of ["price", "serving_weight_grams", "energy_kcal", "protein", "lipid", "glucid", "fiber"] as const) {
+        if (has(field)) data[field] = optionalNonNegativeNumber(body[field], field, errors) as never;
+    }
+
+    if (has("menu_category") && body.menu_category !== undefined && body.menu_category !== null && body.menu_category !== "") {
+        const category = String(body.menu_category);
+        if ((MENU_CATEGORIES as readonly string[]).includes(category)) data.menu_category = category as MenuCategory;
+        else errors.push("Nhóm món không hợp lệ.");
+    }
+    if (has("search_keywords")) data.search_keywords = searchKeywords(body.search_keywords);
+    if (has("dietary_tags")) data.dietary_tags = stringList(body.dietary_tags, DIETARY_TAGS);
+    if (has("allergens")) data.allergens = stringList(body.allergens, ALLERGEN_TAGS);
+    if (has("is_available") && typeof body.is_available === "boolean") data.is_available = body.is_available;
+
+    const nutritionChanged = ["energy_kcal", "protein", "lipid", "glucid", "fiber", "nutrition_source_reference"]
+        .some(has);
+    if (options.allowAdminVerification && has("nutrition_verified")) {
+        data.nutrition_verified = body.nutrition_verified === true;
+        data.nutrition_status = data.nutrition_verified ? "admin_verified" : "owner_provided";
+        data.nutrition_updated_at = new Date();
+    } else if (nutritionChanged || options.creating) {
+        const hasEnergy = Number(data.energy_kcal ?? body.energy_kcal ?? 0) > 0;
+        data.nutrition_verified = false;
+        data.nutrition_status = hasEnergy ? "owner_provided" : "not_provided";
+    }
+    if (nutritionChanged || options.creating) data.nutrition_updated_at = new Date();
+
+    return { data, errors };
 }
 
 function haversineKm(lat1: number, lng1: number, lat2: number, lng2: number): number {
@@ -74,7 +199,10 @@ function scoreStoreForUser(store: any, user?: IUser): { recommendation_score: nu
         store.name,
         store.description,
         store.category,
-        ...(store.menu_items ?? []).map((item: any) => `${item.name_vi ?? ""} ${item.name_en ?? ""} ${item.description ?? ""}`),
+        ...(store.menu_items ?? []).map((item: any) => [
+            item.name_vi, item.name_en, item.description, item.ingredient_summary,
+            ...(item.search_keywords ?? []), ...(item.dietary_tags ?? []),
+        ].filter(Boolean).join(" ")),
     ].filter(Boolean).join(" "));
 
     let score = 0;
@@ -332,6 +460,8 @@ router.get("/menu-search", async (req: Request, res: Response) => {
                         { name_vi: match },
                         { name_en: match },
                         { description: match },
+                        { ingredient_summary: match },
+                        { search_keywords: match },
                     ],
                 },
             },
@@ -342,7 +472,10 @@ router.get("/menu-search", async (req: Request, res: Response) => {
 
         const data = stores.flatMap((store) =>
             (store.menu_items ?? [])
-                .filter((item: any) => item.is_available && [item.name_vi, item.name_en, item.description]
+                .filter((item: any) => item.is_available && [
+                    item.name_vi, item.name_en, item.description, item.ingredient_summary,
+                    ...(item.search_keywords ?? []),
+                ]
                     .filter(Boolean)
                     .some((value) => match.test(String(value))))
                 .map((item: any) => ({
@@ -356,8 +489,14 @@ router.get("/menu-search", async (req: Request, res: Response) => {
                     name: item.name_vi,
                     name_en: item.name_en,
                     description: item.description,
+                    ingredient_summary: item.ingredient_summary,
                     image_url: item.image_url,
                     price: item.price,
+                    menu_category: item.menu_category,
+                    serving_label: item.serving_label || "1 khẩu phần",
+                    serving_weight_grams: item.serving_weight_grams,
+                    dietary_tags: item.dietary_tags ?? [],
+                    allergens: item.allergens ?? [],
                     energy_kcal: item.energy_kcal ?? 0,
                     protein: item.protein ?? 0,
                     lipid: item.lipid ?? 0,
@@ -366,6 +505,11 @@ router.get("/menu-search", async (req: Request, res: Response) => {
                     nutrition_basis: "per_serving" as const,
                     nutrition_available: Number(item.energy_kcal) > 0,
                     nutrition_verified: Boolean(item.nutrition_verified),
+                    nutrition_status: item.nutrition_status || (item.nutrition_verified
+                        ? "admin_verified"
+                        : Number(item.energy_kcal) > 0 ? "owner_provided" : "not_provided"),
+                    nutrition_source_reference: item.nutrition_source_reference,
+                    nutrition_updated_at: item.nutrition_updated_at,
                 })),
         ).slice(0, limit);
 
@@ -505,12 +649,14 @@ router.post("/:id/menu", authenticate, async (req: Request, res: Response) => {
             return;
         }
 
-        const { name_vi, name_en, price, description, image_url, energy_kcal, protein, lipid, glucid, fiber } = req.body;
+        const { data, errors } = buildMenuItemInput(req.body as Record<string, unknown>, { creating: true });
+        if (errors.length) { res.status(400).json({ error: "invalid_menu_item", message: errors[0], details: errors }); return; }
+
+        // Owners can provide nutrition, but cannot self-verify it. Verification is an admin-only action.
         store.menu_items.push({
-            name_vi, name_en, price, description, image_url,
-            energy_kcal, protein, lipid, glucid, fiber,
-            is_available: true,
-        });
+            ...data,
+            is_available: data.is_available ?? true,
+        } as any);
         await store.save();
         res.json(store);
     } catch (error) {
@@ -523,12 +669,13 @@ router.put("/:id/menu/:itemId", authenticate, async (req: Request, res: Response
         const user  = req.user as IUser;
         const store = await Store.findById(req.params.id);
         if (!store) { res.status(404).json({ error: "Store not found" }); return; }
-        if (String(store.owner_id) !== String((user as any)._id)) {
-            res.status(403).json({ error: "Forbidden" }); return;
-        }
+        if (!ownerStoreOrFail(store, user, res)) return;
         const item = (store.menu_items as any).id(req.params.itemId);
         if (!item) { res.status(404).json({ error: "Menu item not found" }); return; }
-        Object.assign(item, req.body);
+        const isAdmin = ["admin", "moderator"].includes((user as any).role);
+        const { data, errors } = buildMenuItemInput(req.body as Record<string, unknown>, { allowAdminVerification: isAdmin });
+        if (errors.length) { res.status(400).json({ error: "invalid_menu_item", message: errors[0], details: errors }); return; }
+        Object.assign(item, data);
         await store.save();
         res.json(store);
     } catch (error) {
@@ -582,18 +729,27 @@ router.post("/:id/menu/bulk", authenticate, async (req: Request, res: Response) 
         for (const row of rows) {
             const name_vi = row["name_vi"] || row["Tên món"] || row["name"];
             if (!name_vi) continue;
-            store.menu_items.push({
+            const { data, errors } = buildMenuItemInput({
                 name_vi,
-                name_en: row["name_en"] || row["English name"] || undefined,
-                price: row["price"] ? Number(row["price"]) : undefined,
-                description: row["description"] || undefined,
-                energy_kcal: row["energy_kcal"] || row["Calories"] ? Number(row["energy_kcal"] || row["Calories"]) : undefined,
-                protein: row["protein"] ? Number(row["protein"]) : undefined,
-                lipid:   row["lipid"]   ? Number(row["lipid"])   : undefined,
-                glucid:  row["glucid"]  ? Number(row["glucid"])  : undefined,
-                fiber:   row["fiber"]   ? Number(row["fiber"])   : undefined,
-                is_available: true,
-            });
+                name_en: row["name_en"] || row["English name"],
+                price: row["price"],
+                description: row["description"],
+                ingredient_summary: row["ingredient_summary"] || row["ingredients"],
+                menu_category: row["menu_category"] || row["category"],
+                serving_label: row["serving_label"] || row["serving"],
+                serving_weight_grams: row["serving_weight_grams"] || row["weight_grams"],
+                search_keywords: row["search_keywords"] || row["keywords"],
+                dietary_tags: row["dietary_tags"],
+                allergens: row["allergens"],
+                nutrition_source_reference: row["nutrition_source_reference"],
+                energy_kcal: row["energy_kcal"] || row["Calories"],
+                protein: row["protein"],
+                lipid: row["lipid"],
+                glucid: row["glucid"],
+                fiber: row["fiber"],
+            }, { creating: true });
+            if (errors.length) continue;
+            store.menu_items.push({ ...data, is_available: true } as any);
             added++;
         }
 
@@ -628,7 +784,7 @@ router.post("/:id/menu/:itemId/ai-nutrition", authenticate, async (req: Request,
         const anthropicKey = process.env.ANTHROPIC_API_KEY;
         if (anthropicKey) {
             const axios = (await import("axios")).default;
-            const prompt = `Estimate the nutritional values per serving for this Vietnamese food item: "${item.name_vi}"${item.description ? ` (${item.description})` : ""}.
+        const prompt = `Estimate the nutritional values for one serving of this Vietnamese food item: "${item.name_vi}"${item.description ? ` (${item.description})` : ""}${item.ingredient_summary ? ` Ingredients: ${item.ingredient_summary}.` : ""}${item.serving_label ? ` Serving: ${item.serving_label}${item.serving_weight_grams ? ` (${item.serving_weight_grams}g)` : ""}.` : ""}
 Return ONLY a JSON object with these exact fields (numbers only, no units):
 {"energy_kcal": number, "protein": number, "lipid": number, "glucid": number, "fiber": number}`;
 
@@ -655,7 +811,12 @@ Return ONLY a JSON object with these exact fields (numbers only, no units):
             estimate = buildHeuristicEstimate(item.name_vi);
         }
 
-        Object.assign(item, estimate, { nutrition_verified: false });
+        Object.assign(item, estimate, {
+            nutrition_verified: false,
+            nutrition_status: "ai_estimated",
+            nutrition_source_reference: "Ước tính bởi CaloVie AI",
+            nutrition_updated_at: new Date(),
+        });
         await store.save();
         res.json({ estimate, item });
     } catch (error) {

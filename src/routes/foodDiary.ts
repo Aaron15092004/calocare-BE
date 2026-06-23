@@ -15,6 +15,10 @@ const NutritionSchema = z.object({
     fiber: z.number().finite().min(0).max(1000).optional().default(0),
 });
 
+const OptionalUrlSchema = z.union([z.string().url(), z.literal(""), z.null()])
+    .optional()
+    .transform((value) => value || undefined);
+
 const FoodItemSchema = z.object({
     dish_name: z.string().min(1).max(200),
     source: z.enum(["recipe", "food", "ai_estimate", "usda", "fatsecret", "store_menu"]),
@@ -40,9 +44,9 @@ const CreateDiarySchema = z.object({
     vitamins: z.unknown().optional(),
     healthTips: z.unknown().optional(),
     health_tips: z.unknown().optional(),
-    imageUrl: z.string().url().optional().or(z.literal("").transform(() => undefined)),
-    image_url: z.string().url().optional().or(z.literal("").transform(() => undefined)),
-    notes: z.string().max(1000).optional(),
+    imageUrl: OptionalUrlSchema,
+    image_url: OptionalUrlSchema,
+    notes: z.string().max(1000).nullable().optional().transform((value) => value || undefined),
 });
 
 const ScanResultSchema = z.object({

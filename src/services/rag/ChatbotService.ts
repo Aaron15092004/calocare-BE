@@ -778,7 +778,12 @@ export class ChatbotService {
         allergies: string[],
         dietaryPreference: string,
     ): { score: number; reasons: string[] } {
-        const haystack = this._normalizeText(`${item.name_vi ?? ""} ${item.name_en ?? ""} ${item.description ?? ""}`);
+        const dietaryTags = Array.isArray(item.dietary_tags) ? item.dietary_tags.map((tag: unknown) => this._normalizeText(String(tag))) : [];
+        const declaredAllergens = Array.isArray(item.allergens) ? item.allergens.map((tag: unknown) => this._normalizeText(String(tag))) : [];
+        const haystack = this._normalizeText([
+            item.name_vi, item.name_en, item.description, item.ingredient_summary,
+            ...(item.search_keywords ?? []), ...dietaryTags,
+        ].filter(Boolean).join(" "));
         const energy = Number(item.energy_kcal ?? 0);
         const protein = Number(item.protein ?? 0);
         const carbs = Number(item.glucid ?? 0);
@@ -821,7 +826,7 @@ export class ChatbotService {
 
         if (dietaryPreference === "vegetarian" || dietaryPreference === "vegan") {
             const plantHints = ["chay", "rau", "dau hu", "nam", "salad", "tofu", "vegan", "vegetarian"];
-            if (plantHints.some((hint) => haystack.includes(hint))) {
+            if (dietaryTags.includes(dietaryPreference) || plantHints.some((hint) => haystack.includes(hint))) {
                 score += 3;
                 reasons.push("hợp chế độ ăn của bạn");
             }
@@ -837,12 +842,15 @@ export class ChatbotService {
             dairy: ["sua", "cheese", "milk", "yogurt"],
             egg: ["trung", "egg"],
         };
-        const hasAllergyConflict = allergies.some((allergy) =>
-            (allergyHints[this._normalizeText(allergy)] ?? [this._normalizeText(allergy)])
-                .some((hint) => hint && haystack.includes(hint)),
-        );
+        const hasAllergyConflict = allergies.some((allergy) => {
+            const normalizedAllergy = this._normalizeText(allergy);
+            const hints = allergyHints[normalizedAllergy] ?? [normalizedAllergy];
+            return declaredAllergens.includes(normalizedAllergy)
+                || hints.some((hint) => hint && (declaredAllergens.includes(hint) || haystack.includes(hint)));
+        });
         if (hasAllergyConflict) {
-            score -= 10;
+            // A declared allergen must never be offset by a positive nutrition score.
+            score = -100;
             reasons.push("cần kiểm tra dị ứng trước khi đặt");
         }
 

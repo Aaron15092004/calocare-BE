@@ -5,13 +5,23 @@ export interface IMenuItem {
     name_en?: string;
     price?: number;
     description?: string;
+    ingredient_summary?: string;
     image_url?: string;
+    menu_category?: "breakfast" | "main" | "snack" | "drink" | "dessert" | "other";
+    serving_label?: string;
+    serving_weight_grams?: number;
+    search_keywords?: string[];
+    dietary_tags?: string[];
+    allergens?: string[];
     energy_kcal?: number;
     protein?: number;
     lipid?: number;
     glucid?: number;
     fiber?: number;
     nutrients_extended?: Record<string, unknown>;
+    nutrition_status?: "not_provided" | "owner_provided" | "ai_estimated" | "admin_verified";
+    nutrition_source_reference?: string;
+    nutrition_updated_at?: Date;
     nutrition_verified?: boolean;
     is_available: boolean;
 }
@@ -47,13 +57,31 @@ const MenuItemSchema = new Schema<IMenuItem>({
     name_en: { type: String },
     price: { type: Number },
     description: { type: String },
+    ingredient_summary: { type: String },
     image_url: { type: String },
+    menu_category: {
+        type: String,
+        enum: ["breakfast", "main", "snack", "drink", "dessert", "other"],
+        default: "main",
+    },
+    serving_label: { type: String, default: "1 khẩu phần" },
+    serving_weight_grams: { type: Number },
+    search_keywords: [{ type: String }],
+    dietary_tags: [{ type: String }],
+    allergens: [{ type: String }],
     energy_kcal: { type: Number },
     protein: { type: Number },
     lipid: { type: Number },
     glucid: { type: Number },
     fiber: { type: Number },
     nutrients_extended: { type: Schema.Types.Mixed },
+    nutrition_status: {
+        type: String,
+        enum: ["not_provided", "owner_provided", "ai_estimated", "admin_verified"],
+        default: "not_provided",
+    },
+    nutrition_source_reference: { type: String },
+    nutrition_updated_at: { type: Date },
     nutrition_verified: { type: Boolean, default: false },
     is_available: { type: Boolean, default: true },
 }, { _id: true });
