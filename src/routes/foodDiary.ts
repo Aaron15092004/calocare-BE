@@ -17,7 +17,7 @@ const NutritionSchema = z.object({
 
 const FoodItemSchema = z.object({
     dish_name: z.string().min(1).max(200),
-    source: z.enum(["recipe", "food", "ai_estimate", "usda", "fatsecret"]),
+    source: z.enum(["recipe", "food", "ai_estimate", "usda", "fatsecret", "store_menu"]),
     matched_name: z.string().max(200).optional(),
     nutrition: NutritionSchema,
     weight_grams: z.number().finite().min(0).max(5000).optional(),
@@ -25,6 +25,9 @@ const FoodItemSchema = z.object({
     recipe_id: z.string().optional(),
     food_id: z.string().optional(),
     usda_fdc_id: z.number().int().positive().optional(),
+    store_id: z.string().optional(),
+    store_name: z.string().max(120).optional(),
+    menu_item_id: z.string().max(100).optional(),
 });
 
 const CreateDiarySchema = z.object({

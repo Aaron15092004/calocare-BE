@@ -39,6 +39,10 @@ function normalizeText(value: string): string {
     return value.toLowerCase();
 }
 
+function escapeRegex(value: string): string {
+    return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
 function haversineKm(lat1: number, lng1: number, lat2: number, lng2: number): number {
     const toRad = (deg: number) => deg * Math.PI / 180;
     const dLat = toRad(lat2 - lat1);
@@ -299,6 +303,73 @@ router.post("/:id/reject", authenticate, requireAdmin, async (req: Request, res:
         );
         if (!updated) { res.status(404).json({ error: "Store not found" }); return; }
         res.json(updated);
+    } catch (error) {
+        res.status(500).json({ error: (error as Error).message });
+    }
+});
+
+// ── GET /api/stores/menu-search — searchable, owner-scoped menu items ───────
+// Store menus remain private to their owning store; this only exposes active,
+// available dishes as loggable results and never creates shared Food records.
+router.get("/menu-search", async (req: Request, res: Response) => {
+    try {
+        const query = String(req.query.q ?? "").trim();
+        const requestedLimit = Number(req.query.limit ?? 10);
+        const limit = Number.isFinite(requestedLimit) ? Math.min(Math.max(requestedLimit, 1), 30) : 10;
+
+        if (query.length < 2) {
+            res.json({ data: [], total: 0 });
+            return;
+        }
+
+        const match = new RegExp(escapeRegex(query), "i");
+        const stores = await Store.find({
+            is_active: true,
+            menu_items: {
+                $elemMatch: {
+                    is_available: true,
+                    $or: [
+                        { name_vi: match },
+                        { name_en: match },
+                        { description: match },
+                    ],
+                },
+            },
+        })
+            .select("name address menu_items")
+            .limit(limit)
+            .lean();
+
+        const data = stores.flatMap((store) =>
+            (store.menu_items ?? [])
+                .filter((item: any) => item.is_available && [item.name_vi, item.name_en, item.description]
+                    .filter(Boolean)
+                    .some((value) => match.test(String(value))))
+                .map((item: any) => ({
+                    id: `${store._id}:${item._id}`,
+                    source_type: "store_menu" as const,
+                    source_id: String(item._id),
+                    store_id: String(store._id),
+                    store_name: store.name,
+                    store_address: store.address,
+                    menu_item_id: String(item._id),
+                    name: item.name_vi,
+                    name_en: item.name_en,
+                    description: item.description,
+                    image_url: item.image_url,
+                    price: item.price,
+                    energy_kcal: item.energy_kcal ?? 0,
+                    protein: item.protein ?? 0,
+                    lipid: item.lipid ?? 0,
+                    glucid: item.glucid ?? 0,
+                    fiber: item.fiber ?? 0,
+                    nutrition_basis: "per_serving" as const,
+                    nutrition_available: Number(item.energy_kcal) > 0,
+                    nutrition_verified: Boolean(item.nutrition_verified),
+                })),
+        ).slice(0, limit);
+
+        res.json({ data, total: data.length });
     } catch (error) {
         res.status(500).json({ error: (error as Error).message });
     }

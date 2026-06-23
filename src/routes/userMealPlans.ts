@@ -7,7 +7,8 @@ import MealPlanItem from "../models/MealPlanItem";
 
 const ITEM_POPULATE = [
     { path: "recipe_id", select: "name_vi name_en calories protein carbs fat fiber description instructions image_url" },
-    { path: "food_id",   select: "name_vi name_en energy_kcal image_url" },
+    { path: "food_id",   select: "name_vi name_en energy_kcal protein lipid glucid fiber image_url" },
+    { path: "usda_food_id", select: "description_vi description_en energy_kcal protein lipid glucid fiber" },
 ];
 
 const router = Router();

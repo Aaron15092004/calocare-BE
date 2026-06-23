@@ -6,6 +6,7 @@ export interface IMealProgress extends Document {
     day_number: number;
     meal_type: "breakfast" | "lunch" | "dinner" | "snack" | "morning_snack" | "afternoon_snack";
     recipe_id?: Types.ObjectId;
+    diary_entry_id?: Types.ObjectId;
     completed_at: Date;
     notes?: string;
     created_at: Date;
@@ -23,6 +24,9 @@ const MealProgressSchema = new Schema<IMealProgress>(
             required: true,
         },
         recipe_id: { type: Schema.Types.ObjectId, ref: "Recipe" },
+        // Links a completed planned meal to the diary entry created from it.
+        // This makes undo deterministic instead of leaving orphaned calories behind.
+        diary_entry_id: { type: Schema.Types.ObjectId, ref: "FoodDiary" },
         completed_at: { type: Date, default: Date.now },
         notes: { type: String },
     },

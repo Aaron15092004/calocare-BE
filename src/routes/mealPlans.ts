@@ -1,6 +1,8 @@
 import { Router, Request, Response } from "express";
+import mongoose from "mongoose";
 import { authenticate } from "../middleware/auth";
 import { requireAdmin } from "../middleware/roleCheck";
+import { monthKey, secondsUntilEndOfMonthUTC } from "../middleware/ragRateLimit";
 import MealPlan from "../models/MealPlan";
 import MealPlanItem from "../models/MealPlanItem";
 import UserMealPlan from "../models/UserMealPlan";
@@ -9,6 +11,8 @@ import User, { IUser } from "../models/User";
 
 const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-flash-latest";
 const GEMINI_BASE  = "https://generativelanguage.googleapis.com/v1beta/models";
+const REWARD_COUNTER_COLLECTION = "rate_limit_counters";
+const MEAL_PLAN_VIDEOS_REQUIRED = 5;
 
 function cleanJson(raw: string): string {
     let s = raw.trim();
@@ -98,7 +102,8 @@ router.get("/:id", authenticate, async (req: Request, res: Response) => {
         }
         const items = await MealPlanItem.find({ meal_plan_id: plan._id })
             .populate("recipe_id", "name_vi name_en calories protein carbs fat fiber description instructions image_url")
-            .populate("food_id", "name_vi name_en energy_kcal")
+            .populate("food_id", "name_vi name_en energy_kcal protein lipid glucid fiber image_url")
+            .populate("usda_food_id", "description_vi description_en energy_kcal protein lipid glucid fiber")
             .sort({ day_number: 1, sort_order: 1 });
 
         res.json({ ...plan.toObject(), items });
@@ -422,14 +427,10 @@ router.get("/:id/shopping-list", authenticate, async (req: Request, res: Respons
 
 // POST /api/meal-plans/generate — CaloVie AI personalized meal plan (Premium = 7d, Pro = 21d)
 router.post("/generate", authenticate, async (req: Request, res: Response) => {
+    let consumedFreeReward: { userId: string; month: string } | null = null;
     try {
         const user = req.user as IUser;
         const tier: string = (user as any).subscription_tier ?? "free";
-
-        if (tier === "free") {
-            res.status(403).json({ error: "Tính năng này yêu cầu gói Premium hoặc Pro." });
-            return;
-        }
 
         const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
         if (!GEMINI_API_KEY) {
@@ -576,6 +577,29 @@ Trả lời CHỈ bằng JSON hợp lệ:
             return;
         }
 
+        if (tier === "free") {
+            const userId = (user._id as { toString(): string }).toString();
+            const month = monthKey();
+            const unlockKey = `${userId}:meal_plan_unlock:${month}`;
+            const db = mongoose.connection.db;
+            if (!db) {
+                res.status(503).json({ error: "Hệ thống phần thưởng đang tạm thời không khả dụng." });
+                return;
+            }
+
+            // Atomically spend the monthly reward only after the AI returned valid content.
+            // This prevents concurrent requests from creating more than one free plan.
+            const consumed = await db.collection(REWARD_COUNTER_COLLECTION).findOneAndDelete({ key: unlockKey });
+            if (!consumed) {
+                res.status(403).json({
+                    error: "Hãy nâng cấp Premium hoặc hoàn tất 5 video thưởng để mở khóa 1 thực đơn tháng này.",
+                    code: "meal_plan_reward_required",
+                });
+                return;
+            }
+            consumedFreeReward = { userId, month };
+        }
+
         // Create MealPlan header
         const plan = await MealPlan.create({
             title:       parsed.title || `Thực đơn ${totalDays} ngày cá nhân hóa`,
@@ -633,6 +657,11 @@ Trả lời CHỈ bằng JSON hợp lệ:
         }));
         await MealPlanItem.insertMany(itemDocs);
 
+        if (consumedFreeReward) {
+            const videosKey = `${consumedFreeReward.userId}:meal_plan_videos:${consumedFreeReward.month}`;
+            await mongoose.connection.db?.collection(REWARD_COUNTER_COLLECTION).deleteOne({ key: videosKey });
+        }
+
         res.status(201).json({
             plan_id:     (plan._id as any).toString(),
             title:       plan.title,
@@ -642,6 +671,15 @@ Trả lời CHỈ bằng JSON hợp lệ:
             days:        parsed.days,
         });
     } catch (error) {
+        if (consumedFreeReward) {
+            const expiresAt = new Date(Date.now() + secondsUntilEndOfMonthUTC() * 1000);
+            const unlockKey = `${consumedFreeReward.userId}:meal_plan_unlock:${consumedFreeReward.month}`;
+            await mongoose.connection.db?.collection(REWARD_COUNTER_COLLECTION).updateOne(
+                { key: unlockKey },
+                { $set: { count: 1, expires_at: expiresAt }, $setOnInsert: { key: unlockKey } },
+                { upsert: true },
+            ).catch(() => undefined);
+        }
         const err = error as any;
         if (err.name === "AbortError") {
             res.status(504).json({ error: "AI mất quá nhiều thời gian, vui lòng thử lại." });
