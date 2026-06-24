@@ -77,6 +77,17 @@ function userObjectId(id: string) {
 }
 
 function serializeUser(user: IUser) {
+    const preferences = (user.preferences ?? {}) as Record<string, unknown>;
+    const onboardingCompleted = Boolean(preferences.onboarding_completed) || [
+        preferences.age,
+        preferences.gender,
+        preferences.height_cm,
+        preferences.weight_kg,
+        preferences.activity_level,
+        preferences.goal,
+        user.daily_nutrition_goals?.calories,
+    ].every((value) => value !== undefined && value !== null && value !== "");
+
     return {
         id: user._id,
         email: user.email,
@@ -89,7 +100,7 @@ function serializeUser(user: IUser) {
         language: user.language,
         daily_nutrition_goals: user.daily_nutrition_goals,
         preferences: user.preferences,
-        onboarding_completed: Boolean((user.preferences as Record<string, unknown>)?.onboarding_completed),
+        onboarding_completed: onboardingCompleted,
         created_at: user.created_at,
     };
 }
@@ -197,19 +208,24 @@ router.post("/native/apple", authLimiter, async (req: Request, res: Response) =>
         if (!identityToken) { res.status(400).json({ error: "identity_token is required" }); return; }
 
         const identity = await verifyNativeAppleIdentity(identityToken);
+        const fallbackEmail = typeof req.body.email === "string" ? req.body.email.trim().toLowerCase() : "";
+        const resolvedEmail = identity.email || fallbackEmail || undefined;
         const providedName = typeof req.body.display_name === "string"
             ? req.body.display_name.trim()
             : typeof req.body.full_name === "string" ? req.body.full_name.trim() : "";
         let user = await User.findOne({ apple_id: identity.subject });
-        if (!user && identity.email) {
-            user = await User.findOne({ email: identity.email });
+        if (!user && resolvedEmail) {
+            user = await User.findOne({ email: resolvedEmail });
             if (user?.apple_id && user.apple_id !== identity.subject) {
                 res.status(409).json({ error: "apple_account_conflict" });
                 return;
             }
         }
-        if (!user && !identity.email) {
-            res.status(400).json({ error: "apple_email_required", message: "Please share your email on the first Apple Sign In." });
+        if (!user && !resolvedEmail) {
+            res.status(400).json({
+                error: "apple_email_required",
+                message: "Apple did not return your email. Please stop using Apple ID for CaloVie in iPhone Settings and try again.",
+            });
             return;
         }
 
@@ -224,10 +240,10 @@ router.post("/native/apple", authLimiter, async (req: Request, res: Response) =>
             if (changed) await user.save();
         } else {
             user = await User.create({
-                email: identity.email!,
+                email: resolvedEmail!,
                 apple_id: identity.subject,
                 apple_refresh_token: encryptedAppleRefreshToken,
-                display_name: providedName || identity.email!.split("@")[0],
+                display_name: providedName || resolvedEmail!.split("@")[0],
             });
         }
 
@@ -310,7 +326,7 @@ router.delete("/account", authenticate, async (req: Request, res: Response) => {
         const userMealPlanIds = userMealPlans.map((plan) => plan._id);
         const ownedFamilyGroupIds = ownedFamilyGroups.map((group) => group._id);
 
-        await Promise.all([
+        const cleanupResults = await Promise.allSettled([
             revokeAppleRefreshToken(deletingUser?.apple_refresh_token),
             ChatSession.deleteMany({ user_id: userObjectIdValue }),
             FoodDiary.deleteMany({ user_id: userObjectIdValue }),
@@ -339,15 +355,25 @@ router.delete("/account", authenticate, async (req: Request, res: Response) => {
             ),
             Recipe.updateMany({ creator_id: userObjectIdValue }, { $unset: { creator_id: 1 } }),
             Food.updateMany({ creator_id: userObjectIdValue }, { $unset: { creator_id: 1 } }),
-            User.findByIdAndDelete(userObjectIdValue),
         ]);
 
-        await recalcRatingsForTargets(
-            ownReviews.map((review) => ({
-                target_type: review.target_type,
-                target_id: review.target_id.toString(),
-            })),
-        );
+        await User.findByIdAndDelete(userObjectIdValue);
+
+        try {
+            await recalcRatingsForTargets(
+                ownReviews.map((review) => ({
+                    target_type: review.target_type,
+                    target_id: review.target_id.toString(),
+                })),
+            );
+        } catch (recalcError) {
+            console.warn("[auth] account deletion rating recalculation warning:", recalcError);
+        }
+
+        const failedCleanup = cleanupResults.filter((result) => result.status === "rejected");
+        if (failedCleanup.length) {
+            console.warn("[auth] account deletion cleanup warnings:", failedCleanup.map((result) => (result as PromiseRejectedResult).reason));
+        }
 
         res.json({ success: true, message: "Account deleted successfully" });
     } catch (error) {

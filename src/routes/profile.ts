@@ -23,8 +23,21 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
     return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function onboardingCompleted(user: Pick<IUser, "preferences">): boolean {
-    return Boolean((user.preferences as Record<string, unknown>)?.onboarding_completed);
+function onboardingCompleted(user: Pick<IUser, "preferences" | "daily_nutrition_goals">): boolean {
+    const preferences = (user.preferences ?? {}) as Record<string, unknown>;
+    if (Boolean(preferences.onboarding_completed)) return true;
+
+    const hasLegacyProfile = [
+        preferences.age,
+        preferences.gender,
+        preferences.height_cm,
+        preferences.weight_kg,
+        preferences.activity_level,
+        preferences.goal,
+        user.daily_nutrition_goals?.calories,
+    ].every((value) => value !== undefined && value !== null && value !== "");
+
+    return hasLegacyProfile;
 }
 
 function legacyProfileFields(user: Pick<IUser, "preferences" | "daily_nutrition_goals">) {
@@ -70,7 +83,7 @@ function calculateDailyGoals(input: {
 }
 
 const OnboardingSchema = z.object({
-    display_name: z.string().trim().min(2).max(80),
+    display_name: z.string().trim().min(2).max(80).optional(),
     age: z.number().int().min(18).max(120),
     gender: z.enum(["male", "female", "other"]),
     height_cm: z.number().min(100).max(250),
@@ -188,12 +201,18 @@ router.put("/onboarding", authenticate, async (req: Request, res: Response) => {
     }
 
     try {
+        const currentUser = req.user as IUser;
         const goals = calculateDailyGoals(parsed.data);
+        const resolvedDisplayName =
+            parsed.data.display_name?.trim() ||
+            currentUser.display_name?.trim() ||
+            currentUser.email?.split("@")[0] ||
+            "CaloVie User";
         const updated = await User.findByIdAndUpdate(
-            (req.user as IUser)._id,
+            currentUser._id,
             {
                 $set: {
-                    display_name: parsed.data.display_name,
+                    display_name: resolvedDisplayName,
                     daily_nutrition_goals: goals,
                     "preferences.age": parsed.data.age,
                     "preferences.gender": parsed.data.gender,

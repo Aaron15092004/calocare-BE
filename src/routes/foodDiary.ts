@@ -46,6 +46,7 @@ const CreateDiarySchema = z.object({
     health_tips: z.unknown().optional(),
     imageUrl: OptionalUrlSchema,
     image_url: OptionalUrlSchema,
+    date: z.string().datetime().optional(),
     notes: z.string().max(1000).nullable().optional().transform((value) => value || undefined),
 });
 
@@ -141,6 +142,7 @@ router.post("/", authenticate, async (req: Request, res: Response) => {
             health_tips: payload.health_tips ?? payload.healthTips,
             image_url: payload.image_url ?? payload.imageUrl,
             notes: payload.notes,
+            scanned_at: payload.date ? new Date(payload.date) : undefined,
             user_id: user._id,
         });
         res.status(201).json(entry);
