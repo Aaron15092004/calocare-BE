@@ -6,6 +6,7 @@ import { getEnrichmentService } from "./EnrichmentService";
 import { getFatSecretService } from "./FatSecretService";
 import { getFatSecretImportService, FatSecretImportService } from "./FatSecretImportService";
 import { getTranslationService } from "./TranslationService";
+import { getImageService } from "./ImageService";
 import MealPlan from "../../models/MealPlan";
 import MealPlanItem from "../../models/MealPlanItem";
 import User from "../../models/User";
@@ -636,6 +637,9 @@ export class MealPlanGeneratorService {
                 source_type,
                 serving_size: meal.weight_grams,
                 calories: meal.calories,
+                // Keep the LLM's cooking guidance (used to be discarded);
+                // renderers prefer recipe_id.instructions when a Recipe exists
+                cooking_steps: meal.cooking_steps?.length ? meal.cooking_steps : undefined,
                 sort_order: i,
             });
         }
@@ -717,6 +721,10 @@ export class MealPlanGeneratorService {
         }
 
         await MealPlanItem.insertMany(itemsToInsert);
+
+        // Off the critical path: fill Unsplash images for AI-only items of this
+        // day (recipe/food items get images via their own enrichment pipeline).
+        this._fillCustomFoodImages(planId, day);
 
         // Protein diversity: track source, log streak, override hint for next day
         let nextDayProteinHint: string | undefined;
@@ -944,7 +952,7 @@ export class MealPlanGeneratorService {
    · morning_snack / afternoon_snack / snack: 1 món nhẹ (trái cây/sữa chua/hạt/sữa)
    · lunch: 1–2 món (1 đơn lẻ HOẶC cơm + 1 protein)
    · dinner: 2–3 món (cơm + protein + canh/rau — lặp meal_type để thêm)
-4. cooking_steps: 2–4 bước nấu ngắn gọn thực tế bằng tiếng Việt
+4. cooking_steps: 3–5 bước nấu CỤ THỂ bằng tiếng Việt — ghi rõ định lượng nguyên liệu chính (vd "200g thịt gà", "2 thìa nước mắm"), thời gian và lửa (vd "kho lửa vừa 20 phút"). Món ăn liền (trái cây, sữa chua) chỉ cần 1 bước.
 5. Tổng calories mỗi bữa ±20% mục tiêu
 6. Đa dạng nguồn protein, không lặp cùng loại đạm trong ngày
 7. TUYỆT ĐỐI không chọn món chứa dị ứng/kiêng bắt buộc của người dùng${avoidLine}`;
@@ -1491,6 +1499,32 @@ Trả về JSON hợp lệ (không markdown, không giải thích):`;
             return !landMeatTerms.some((term) => normalized.includes(term));
         }
         return true;
+    }
+
+    // Fire-and-forget Unsplash image fill for a day's ai_generated items.
+    // ImageService enforces its own hourly quota (returns null / throws
+    // UnsplashRateLimitError when exhausted) so this can never run away.
+    private _fillCustomFoodImages(planId: Types.ObjectId, day: number): void {
+        void (async () => {
+            const items = await MealPlanItem.find({
+                meal_plan_id: planId,
+                day_number: day,
+                source_type: "ai_generated",
+                image_url: { $exists: false },
+            }).select("_id custom_food").lean();
+
+            for (const item of items) {
+                const name = (item as { custom_food?: { name?: string } }).custom_food?.name;
+                if (!name) continue;
+                const result = await getImageService().fetchFoodImage(`${name} vietnamese food`);
+                if (result?.url) {
+                    await MealPlanItem.updateOne({ _id: item._id }, { $set: { image_url: result.url } });
+                }
+            }
+        })().catch((err) => {
+            // Rate limit or transient failure — items simply stay imageless
+            console.warn(`[MealPlanGenerator] image fill day ${day}:`, err instanceof Error ? err.message : String(err));
+        });
     }
 
     private _toCustomFood(meal: MealItem) {

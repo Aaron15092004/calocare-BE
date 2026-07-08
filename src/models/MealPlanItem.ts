@@ -22,6 +22,12 @@ export interface IMealPlanItem extends Document {
     source_type?: "food" | "recipe" | "usda" | "ai_generated";
     serving_size?: number;
     calories?: number;
+    // AI-generated cooking guidance for items without a linked Recipe;
+    // renderers prefer recipe_id.instructions when available
+    cooking_steps?: string[];
+    // Item-level image for custom_food/ai items that can't carry one via
+    // recipe_id/food_id (filled in the background from Unsplash)
+    image_url?: string;
     sort_order: number;
     created_at: Date;
     updated_at: Date;
@@ -57,6 +63,8 @@ const MealPlanItemSchema = new Schema<IMealPlanItem>(
         source_type: { type: String, enum: ["food", "recipe", "usda", "ai_generated"] },
         serving_size: { type: Number },
         calories: { type: Number },
+        cooking_steps: [{ type: String }],
+        image_url: { type: String },
         sort_order: { type: Number, default: 0 },
     },
     {

@@ -53,10 +53,40 @@ router.get("/", authenticate, async (req: Request, res: Response) => {
         // Hide in-flight/failed generations (legacy docs have no status field and pass)
         filter.status = { $nin: ["generating", "failed"] };
 
-        const plans = await MealPlan.find(filter)
+        const isCommunity = community === "true";
+        let query = MealPlan.find(filter)
             .sort({ created_at: -1 })
             .limit(Math.min(Number(limit) || 50, 100))
             .skip(Number(offset) || 0);
+        if (isCommunity) query = query.populate("creator_id", "display_name");
+        const plans = await query.lean();
+
+        // Community cards need more than title+tags: average daily kcal and a
+        // preview image derived from the plan's items
+        if (isCommunity && plans.length) {
+            const planIds = plans.map((p) => p._id);
+            const stats = await MealPlanItem.aggregate([
+                { $match: { meal_plan_id: { $in: planIds } } },
+                {
+                    $group: {
+                        _id: "$meal_plan_id",
+                        total_calories: { $sum: { $ifNull: ["$calories", 0] } },
+                        item_count: { $sum: 1 },
+                        preview_image: { $max: "$image_url" },
+                    },
+                },
+            ]);
+            const statMap = new Map(stats.map((s) => [s._id.toString(), s]));
+            for (const plan of plans as Array<Record<string, unknown>>) {
+                const stat = statMap.get(String(plan._id));
+                const totalDays = Number(plan.total_days) || 1;
+                (plan as Record<string, unknown>).avg_daily_kcal = stat
+                    ? Math.round((stat.total_calories || 0) / totalDays)
+                    : null;
+                (plan as Record<string, unknown>).item_count = stat?.item_count ?? 0;
+                (plan as Record<string, unknown>).preview_image = stat?.preview_image ?? null;
+            }
+        }
 
         const total = await MealPlan.countDocuments(filter);
         res.json({ data: plans, total });
