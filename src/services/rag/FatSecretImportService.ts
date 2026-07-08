@@ -16,6 +16,8 @@ import FoodVector from "../../models/FoodVector";
 import Recipe from "../../models/Recipe";
 import { getFatSecretService, FatSecretSearchResult, FatSecretFood } from "./FatSecretService";
 import { getEmbeddingService } from "./EmbeddingService";
+import { getTranslationService } from "./TranslationService";
+import { getGroqService, LLMMessage } from "./GroqService";
 import { buildFoodSearchText } from "../../utils/searchTextBuilder";
 import { extractDietTags } from "../../utils/dietTagger";
 
@@ -65,6 +67,64 @@ export class FatSecretImportService {
         };
     }
 
+    /**
+     * Translate a single English food name to Vietnamese via TranslationService
+     * (Groq-backed, cached).  Never throws — falls back to the English name with
+     * a warning so an import is never aborted by a translation failure.
+     */
+    private async _translateNameToVi(nameEn: string): Promise<string> {
+        try {
+            const [translated] = await getTranslationService().translateBatch([nameEn]);
+            return translated || nameEn;
+        } catch (err) {
+            console.warn(
+                `[FatSecretImport] en→vi translation failed for "${nameEn}" — storing English name:`,
+                (err as Error).message,
+            );
+            return nameEn;
+        }
+    }
+
+    /**
+     * One lightweight Groq call classifying which of the given food names are NOT
+     * actual foods/dishes suitable for a Vietnamese nutrition-tracking app
+     * (cocktails/alcoholic drinks, protein powders/supplements, brand-only names,
+     * non-food items).  Returns the set of 0-based indices to EXCLUDE.
+     * Throws on API/parse failure — callers fail open (import everything).
+     */
+    private async _classifyJunkFoods(names: string[]): Promise<Set<number>> {
+        const messages: LLMMessage[] = [
+            {
+                role: "system",
+                content:
+                    "You are a strict curator for a Vietnamese nutrition-tracking food database. " +
+                    "You will receive a JSON array of food names from a food-database search. " +
+                    "Identify which entries are NOT actual foods or dishes suitable for tracking daily nutrition: " +
+                    "cocktails or alcoholic drinks, protein powders or supplements, brand-only names with no food, " +
+                    "and non-food items. Common dishes, ingredients, drinks like juice/milk/coffee, snacks and " +
+                    "desserts ARE valid foods.\n" +
+                    "Return ONLY a JSON array of the 0-based indices to EXCLUDE, e.g. [1,4]. " +
+                    "Return [] if every entry is a valid food. No markdown, no explanation.",
+            },
+            {
+                role: "user",
+                content: JSON.stringify(names),
+            },
+        ];
+
+        const response = await getGroqService().generate(messages, { temperature: 0, maxTokens: 512 });
+        const text = response.content.trim().replace(/^```json\s*/i, "").replace(/```\s*$/i, "").trim();
+
+        const parsed: unknown = JSON.parse(text);
+        if (!Array.isArray(parsed)) throw new Error("junk classification did not return a JSON array");
+
+        return new Set(
+            (parsed as unknown[])
+                .map((v) => (typeof v === "string" ? parseInt(v, 10) : v))
+                .filter((v): v is number => Number.isInteger(v) && (v as number) >= 0 && (v as number) < names.length),
+        );
+    }
+
     private async _getOrCreateFSGroup(): Promise<mongoose.Types.ObjectId> {
         const existing = await FoodGroup.findOne({ code: FS_FOODGROUP_CODE }).select("_id").lean();
         if (existing) return existing._id as mongoose.Types.ObjectId;
@@ -85,19 +145,20 @@ export class FatSecretImportService {
         const nutrition = FatSecretImportService.parseFoodDescription(result.food_description);
         if (!nutrition) return null;
 
-        const displayName = (nameVi && nameVi !== result.food_name) ? nameVi : result.food_name;
-
         const existing = await Food.findOne({ source_reference: ref }).lean();
         if (existing) {
             // Backfill Vietnamese name if the record still has the English name as name_vi
-            if (displayName !== result.food_name && existing.name_vi === existing.name_en) {
-                await Food.updateOne(
-                    { _id: existing._id },
-                    {
-                        $set: { name_vi: displayName },
-                        $addToSet: { search_keywords: displayName.toLowerCase() },
-                    },
-                );
+            if (existing.name_vi === existing.name_en) {
+                const backfillName = nameVi || await this._translateNameToVi(result.food_name);
+                if (backfillName && backfillName !== result.food_name) {
+                    await Food.updateOne(
+                        { _id: existing._id },
+                        {
+                            $set: { name_vi: backfillName },
+                            $addToSet: { search_keywords: backfillName.toLowerCase() },
+                        },
+                    );
+                }
             }
             return existing as unknown as IFood;
         }
@@ -109,6 +170,10 @@ export class FatSecretImportService {
             name_en: { $regex: `^${result.food_name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`, $options: "i" },
         }).select("_id").lean();
         if (nameClash) return nameClash as unknown as IFood;
+
+        // Never write English into name_vi: translate when the caller did not
+        // supply a Vietnamese name (falls back to English only if Groq fails).
+        const displayName = nameVi || await this._translateNameToVi(result.food_name);
 
         const groupId  = await this._getOrCreateFSGroup();
         const tags     = extractDietTags(displayName);
@@ -146,20 +211,16 @@ export class FatSecretImportService {
      * identified during a scan (so future DB searches find it by Vietnamese name).
      */
     async upsertFullFoodWithViName(fsId: string, nameVi: string): Promise<IFood | null> {
-        const food = await this.upsertFullFood(fsId);
-        if (!food || !nameVi) return food;
-        // Patch name_vi if it's still the English FatSecret name
-        if (food.name_vi === food.name_en) {
-            await Food.updateOne({ _id: food._id }, { $set: { name_vi: nameVi } });
-        }
-        return food;
+        return this.upsertFullFood(fsId, nameVi || undefined);
     }
 
     /**
      * Full import: call food.get.v4 for precise per-serving nutrition,
      * normalise to per-100g, then upsert.  Uses more API quota but more accurate.
+     * Optional nameVi sets the Vietnamese display name; when absent the English
+     * name is translated en→vi so name_vi is never left in English.
      */
-    async upsertFullFood(fsId: string): Promise<IFood | null> {
+    async upsertFullFood(fsId: string, nameVi?: string): Promise<IFood | null> {
         if (!FatSecretImportService.isAvailable()) return null;
 
         const ref    = `FS-${fsId}`;
@@ -170,14 +231,15 @@ export class FatSecretImportService {
         if (!nutrition) return null;
 
         const imageUrl = getFatSecretService().extractImage(fsFood);
-        const tags     = extractDietTags(fsFood.food_name);
+        const displayNameVi = nameVi || await this._translateNameToVi(fsFood.food_name);
+        const tags     = extractDietTags(displayNameVi);
 
         const groupId = await this._getOrCreateFSGroup();
         const food = await Food.findOneAndUpdate(
             { source_reference: ref },
             {
                 $set: {
-                    name_vi: fsFood.food_name,
+                    name_vi: displayNameVi,
                     name_en: fsFood.food_name,
                     energy_kcal: nutrition.energy_kcal,
                     protein: nutrition.protein,
@@ -191,7 +253,7 @@ export class FatSecretImportService {
                 $setOnInsert: {
                     source_reference: ref,
                     food_group_id: groupId,
-                    search_keywords: [fsFood.food_name.toLowerCase()],
+                    search_keywords: [...new Set([fsFood.food_name.toLowerCase(), displayNameVi.toLowerCase()])],
                     is_deleted: false,
                 },
             },
@@ -215,7 +277,9 @@ export class FatSecretImportService {
         if (!nutrition) return null;
 
         const imageUrl = getFatSecretService().extractImage(fsFood);
-        const displayNameVi = nameVi || fsFood.food_name;
+        // Never default name_vi to the English name — translate when the caller
+        // did not supply a Vietnamese name (English fallback only on Groq failure).
+        const displayNameVi = nameVi || await this._translateNameToVi(fsFood.food_name);
         const tags = extractDietTags(displayNameVi);
         const keywords = [...new Set([displayNameVi.toLowerCase(), fsFood.food_name.toLowerCase()])];
 
@@ -252,26 +316,82 @@ export class FatSecretImportService {
     /**
      * Search FatSecret for `query` and upsert all results (fast path).
      * Ideal for seeding the local DB — call once per food category.
+     *
+     * Vietnamese-first pipeline:
+     *  1. One Groq classification call filters out non-food junk
+     *     (cocktails, supplements, brand-only names) — fail-open on error.
+     *  2. The top-ranked result (FatSecret relevance) gets the Vietnamese
+     *     `query` term itself as name_vi.
+     *  3. All remaining results are translated en→vi in ONE translateBatch call.
      */
     async batchImportQuery(
         query: string,
         limit = 20,
-    ): Promise<{ query: string; imported: number; skipped: number }> {
+    ): Promise<{ query: string; imported: number; skipped: number; excluded: number }> {
         if (!FatSecretImportService.isAvailable()) {
-            return { query, imported: 0, skipped: 0 };
+            return { query, imported: 0, skipped: 0, excluded: 0 };
         }
 
         const results = await getFatSecretService().searchFoods(query, limit);
         let imported = 0;
         let skipped  = 0;
+        let excluded = 0;
 
-        for (const r of results) {
-            const food = await this.upsertFromSearchResult(r);
+        // 1. Junk filter — one lightweight LLM call per batch, fail-open on error
+        let kept = results;
+        if (results.length > 0) {
+            try {
+                const junkIndices = await this._classifyJunkFoods(results.map((r) => r.food_name));
+                if (junkIndices.size > 0) {
+                    const junkNames = results
+                        .filter((_, i) => junkIndices.has(i))
+                        .map((r) => r.food_name);
+                    console.warn(
+                        `[FatSecretImport] "${query}" — excluding ${junkNames.length} non-food item(s): ${junkNames.join(", ")}`,
+                    );
+                    kept = results.filter((_, i) => !junkIndices.has(i));
+                    excluded = junkIndices.size;
+                }
+            } catch (err) {
+                console.warn(
+                    `[FatSecretImport] junk classification failed for "${query}" — importing all results:`,
+                    (err as Error).message,
+                );
+            }
+        }
+
+        if (kept.length === 0) return { query, imported, skipped, excluded };
+
+        // 2. FatSecret's top-ranked result best matches the query intent —
+        //    give it the Vietnamese query term itself as name_vi.
+        const queryNameVi = query.charAt(0).toUpperCase() + query.slice(1);
+
+        // 3. Batch-translate the remaining results' names in ONE call.
+        const rest = kept.slice(1);
+        let restNamesVi: string[];
+        try {
+            restNamesVi = rest.length > 0
+                ? await getTranslationService().translateBatch(rest.map((r) => r.food_name))
+                : [];
+        } catch (err) {
+            console.warn(
+                `[FatSecretImport] batch en→vi translation failed for "${query}" — storing English names:`,
+                (err as Error).message,
+            );
+            restNamesVi = rest.map((r) => r.food_name);
+        }
+
+        const top = await this.upsertFromSearchResult(kept[0], queryNameVi);
+        if (top) imported++;
+        else skipped++;
+
+        for (let i = 0; i < rest.length; i++) {
+            const food = await this.upsertFromSearchResult(rest[i], restNamesVi[i]);
             if (food) imported++;
             else skipped++;
         }
 
-        return { query, imported, skipped };
+        return { query, imported, skipped, excluded };
     }
 
     /**

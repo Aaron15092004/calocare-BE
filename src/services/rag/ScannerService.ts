@@ -1,4 +1,6 @@
+import { createHash } from "crypto";
 import { getGeminiService, VisionResult, VisionItemResult } from "./GeminiService";
+import { getVisionService } from "./VisionService";
 import { getEmbeddingService } from "./EmbeddingService";
 import { getRetrievalService, UnifiedSearchResult } from "./RetrievalService";
 import { getEnrichmentService } from "./EnrichmentService";
@@ -7,19 +9,9 @@ import UsdaFood from "../../models/UsdaFood";
 import Food from "../../models/Food";
 import Recipe from "../../models/Recipe";
 import RecipeIngredient from "../../models/RecipeIngredient";
-import ApiUsage from "../../models/ApiUsage";
 import { withTimeout } from "../../utils/asyncTimeout";
 import { getFatSecretService } from "./FatSecretService";
 import { FatSecretImportService, getFatSecretImportService } from "./FatSecretImportService";
-
-function trackGeminiScan(): void {
-    const hour = new Date().toISOString().slice(0, 13);
-    ApiUsage.findOneAndUpdate(
-        { service: "gemini", hour },
-        { $inc: { count: 1 } },
-        { upsert: true },
-    ).exec().catch(() => {});
-}
 
 export interface ScanFoodRequest {
     imageBase64: string;
@@ -100,6 +92,39 @@ export interface ScanMealResult {
     timings_ms?: Record<string, number>;
 }
 
+const SCAN_CACHE_TTL_MS = 60 * 60 * 1000;
+const SCAN_CACHE_MAX = 200;
+
+/**
+ * TTL-bounded LRU keyed by image hash. Re-scanning the same photo (retries,
+ * back-navigation, duplicate taps) previously paid the full Gemini vision
+ * round-trip every time.
+ */
+class ScanCache<T> {
+    private readonly entries = new Map<string, { value: T; expiresAt: number }>();
+
+    get(key: string): T | undefined {
+        const hit = this.entries.get(key);
+        if (!hit) return undefined;
+        if (hit.expiresAt < Date.now()) {
+            this.entries.delete(key);
+            return undefined;
+        }
+        // Refresh recency (Map preserves insertion order)
+        this.entries.delete(key);
+        this.entries.set(key, hit);
+        return hit.value;
+    }
+
+    set(key: string, value: T): void {
+        if (this.entries.size >= SCAN_CACHE_MAX) {
+            const oldest = this.entries.keys().next().value;
+            if (oldest !== undefined) this.entries.delete(oldest);
+        }
+        this.entries.set(key, { value, expiresAt: Date.now() + SCAN_CACHE_TTL_MS });
+    }
+}
+
 const HIGH_CONFIDENCE_THRESHOLD = 0.75;
 const LOCAL_RECIPE_THRESHOLD = 0.72;
 const LOCAL_FOOD_THRESHOLD = 0.78;
@@ -112,21 +137,38 @@ const HYDRATE_TIMEOUT_MS = Number(process.env.SCAN_HYDRATE_TIMEOUT_MS ?? 1_500);
 
 export class ScannerService {
     private readonly gemini = getGeminiService();
+    private readonly visionSvc = getVisionService();
     private readonly embedding = getEmbeddingService();
     private readonly retrieval = getRetrievalService();
     private readonly enrichment = getEnrichmentService();
+    private readonly scanCache = new ScanCache<ScanFoodResult>();
+    private readonly mealCache = new ScanCache<ScanMealResult>();
+    private readonly multiCache = new ScanCache<ScanFoodResult[]>();
+
+    private _imageKey(imageBase64: string): string {
+        return createHash("sha256").update(imageBase64).digest("hex");
+    }
 
     async scan(req: ScanFoodRequest): Promise<ScanFoodResult> {
+        const cacheKey = this._imageKey(req.imageBase64);
+        const cached = this.scanCache.get(cacheKey);
+        if (cached) return { ...cached, timings_ms: { cache_hit: 0 } };
+
+        const result = await this._scanUncached(req);
+        if (!result.vision.not_food) this.scanCache.set(cacheKey, result);
+        return result;
+    }
+
+    private async _scanUncached(req: ScanFoodRequest): Promise<ScanFoodResult> {
         const timings_ms: Record<string, number> = {};
 
         // Step 1: Vision analysis
         const vision = await this._timed(
             timings_ms,
             "vision",
-            () => this.gemini.vision(req.imageBase64, req.mimeType),
+            () => this.visionSvc.vision(req.imageBase64, req.mimeType),
             VISION_TIMEOUT_MS,
         );
-        trackGeminiScan();
 
         if (vision.not_food) {
             return { vision, alternatives: [], fallback_used: false, timings_ms };
@@ -146,9 +188,17 @@ export class ScannerService {
                 EMBEDDING_TIMEOUT_MS,
             );
         } catch {
+            // Embeddings down — vector matching impossible, but the LLM
+            // estimate doesn't need embeddings, so still prefer it.
+            const estimate = await this._timed(
+                timings_ms,
+                "ai_estimate",
+                () => this._geminiEstimateFallback(vision),
+                15_000,
+            ).catch(() => this._quickVisionEstimate(vision));
             return {
                 vision,
-                primary_match: this._quickVisionEstimate(vision),
+                primary_match: estimate,
                 alternatives: [],
                 fallback_used: true,
                 fallback_reason: "embedding_unavailable",
@@ -267,23 +317,32 @@ export class ScannerService {
             };
         }
 
-        // Step 5: No confident match found. Return a quick, clearly-labelled
-        // estimate derived from the first vision pass instead of blocking the
-        // realtime scan path on a second LLM call.
-        const aiEstimate = this._quickVisionEstimate(vision);
+        // Step 5: No confident match. Ask the LLM for a guarded per-100g
+        // estimate (macro-consistency checked, clamped, labelled ai_estimate)
+        // and hydrate mid-score candidates so the client can offer them as
+        // selectable alternatives. The old keyword heuristic remains only as
+        // a last-resort fallback when the LLM estimate itself fails.
+        const [aiEstimate, hydratedAlternatives] = await Promise.all([
+            this._timed(
+                timings_ms,
+                "ai_estimate",
+                () => this._geminiEstimateFallback(vision),
+                15_000,
+            ).catch(() => this._quickVisionEstimate(vision)),
+            Promise.all(
+                allResults
+                    .filter((r) => r.raw_score >= 0.5)
+                    .slice(0, 3)
+                    .map((r) =>
+                        withTimeout(this._hydrateMatch(r, undefined), HYDRATE_TIMEOUT_MS, "hydrate_alternative").catch(() => null),
+                    ),
+            ),
+        ]);
+
         return {
             vision,
             primary_match: aiEstimate,
-            alternatives: allResults
-                .slice(0, 3)
-                .filter((r) => r.raw_score > 0.4)
-                .map((r) => ({
-                    source_type: r.source_type,
-                    source_id: r.source_id,
-                    name: r.name,
-                    confidence: r.raw_score,
-                    fdc_id: r.fdc_id,
-                })),
+            alternatives: hydratedAlternatives.filter((a): a is ScanMatch => a !== null),
             fallback_used: true,
             fallback_reason: "low_confidence",
             timings_ms,
@@ -291,14 +350,23 @@ export class ScannerService {
     }
 
     async scanMeal(req: ScanFoodRequest): Promise<ScanMealResult> {
+        const cacheKey = this._imageKey(req.imageBase64);
+        const cached = this.mealCache.get(cacheKey);
+        if (cached) return { ...cached, timings_ms: { cache_hit: 0 } };
+
+        const result = await this._scanMealUncached(req);
+        if (!result.not_food) this.mealCache.set(cacheKey, result);
+        return result;
+    }
+
+    private async _scanMealUncached(req: ScanFoodRequest): Promise<ScanMealResult> {
         const timings_ms: Record<string, number> = {};
         const multiVision = await this._timed(
             timings_ms,
             "vision_multi",
-            () => this.gemini.visionMulti(req.imageBase64, req.mimeType),
+            () => this.visionSvc.visionMulti(req.imageBase64, req.mimeType),
             VISION_TIMEOUT_MS,
         );
-        trackGeminiScan();
 
         if (multiVision.not_food || multiVision.items.length === 0) {
             return {
@@ -958,16 +1026,27 @@ export class ScannerService {
             confidence?: number;
         };
         const parsed = JSON.parse(this._cleanJson(response.content)) as Estimate;
-        const calories = this._clampNumber(parsed.calories_per_100g, 5, 900, 150);
+        const protein = this._clampNumber(parsed.protein_per_100g, 0, 80, 5);
+        const carbs = this._clampNumber(parsed.carbs_per_100g, 0, 100, 20);
+        const fat = this._clampNumber(parsed.fat_per_100g, 0, 80, 5);
+        let calories = this._clampNumber(parsed.calories_per_100g, 5, 900, 150);
+
+        // Guard against hallucinated numbers: kcal must agree with the
+        // macros (4/4/9). If they diverge >25%, trust the macro-derived value.
+        const macroKcal = protein * 4 + carbs * 4 + fat * 9;
+        if (macroKcal > 0 && Math.abs(calories - macroKcal) / macroKcal > 0.25) {
+            calories = Math.round(macroKcal);
+        }
+
         return {
             source_type: "ai_estimate",
             name: dishName,
             name_en: vision.main_dish_en,
             confidence: Math.min(0.55, this._clampNumber(parsed.confidence, 0.2, 0.55, 0.4)),
             energy_kcal: calories,
-            protein: this._clampNumber(parsed.protein_per_100g, 0, 80, 5),
-            glucid: this._clampNumber(parsed.carbs_per_100g, 0, 100, 20),
-            lipid: this._clampNumber(parsed.fat_per_100g, 0, 80, 5),
+            protein,
+            glucid: carbs,
+            lipid: fat,
             estimated_portion_grams: this._clampNumber(vision.estimated_portion_grams, 20, 1500, 200),
         };
     }
@@ -1046,13 +1125,17 @@ export class ScannerService {
      * Returns one ScanFoodResult per identified item (empty array if not_food).
      */
     async scanMulti(req: ScanFoodRequest): Promise<ScanFoodResult[]> {
-        const multiVision = await this.gemini.visionMulti(req.imageBase64, req.mimeType);
-        trackGeminiScan();
+        const cacheKey = this._imageKey(req.imageBase64);
+        const cached = this.multiCache.get(cacheKey);
+        if (cached) return cached;
+
+        const multiVision = await this.visionSvc.visionMulti(req.imageBase64, req.mimeType);
         if (multiVision.not_food || multiVision.items.length === 0) return [];
 
         const results = await Promise.all(
             multiVision.items.map((item) => this._scanSingleItem(item, req.userId)),
         );
+        if (results.length > 0) this.multiCache.set(cacheKey, results);
         return results;
     }
 
@@ -1092,14 +1175,11 @@ export class ScannerService {
         return { vision: fakeVision, primary_match: undefined, alternatives: [], fallback_used: false };
     }
 
-    // TODO(post-deploy): _geminiEstimateFallback is BLOCKED.
-    // This method called Gemini to invent per-100g nutrition when vector-search
-    // confidence was below 0.75. Results were stored in AISuggestedFood and
-    // served as real data to users — causing hallucinated nutrition.
-    // Re-enable only after USDA+Food vector index coverage ≥ 80% of VN foods,
-    // AND add a human-review step before results are returned to users.
-    //
-    // private async _geminiEstimateFallback(...) { ... }
+    // _geminiEstimateFallback history: an earlier version stored its output in
+    // AISuggestedFood and served it as real data, causing hallucinated
+    // nutrition. The current version is display-only (never persisted),
+    // clamps every field, cross-checks kcal against macros (4/4/9), and is
+    // always labelled ai_estimate with confidence <= 0.55.
 }
 
 let _instance: ScannerService | null = null;

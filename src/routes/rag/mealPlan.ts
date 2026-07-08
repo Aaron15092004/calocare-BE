@@ -5,6 +5,7 @@ import { ragRateLimit } from "../../middleware/ragRateLimit";
 import { getMealPlanGeneratorService, GoalType } from "../../services/rag/MealPlanGeneratorService";
 import { IUser } from "../../models/User";
 import { logRag } from "../../utils/logger";
+import { toUserError } from "../../utils/userFacingError";
 
 const router = Router();
 
@@ -70,9 +71,10 @@ router.post("/", authenticate, ragRateLimit("meal-plan"), async (req: Request, r
             status: "ok",
         });
     } catch (err) {
-        const msg = err instanceof Error ? err.message : "Generation failed";
-        logRag({ endpoint: "meal-plan", userId, latency_ms: Date.now() - t0, status: "error", error: msg });
-        sendEvent("error", { message: msg });
+        const raw = err instanceof Error ? err.message : "Generation failed";
+        logRag({ endpoint: "meal-plan", userId, latency_ms: Date.now() - t0, status: "error", error: raw });
+        const friendly = toUserError(err);
+        sendEvent("error", { message: friendly.message, code: friendly.code });
     } finally {
         res.end();
     }

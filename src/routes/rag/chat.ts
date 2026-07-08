@@ -5,6 +5,7 @@ import { ragRateLimit } from "../../middleware/ragRateLimit";
 import { getChatbotService } from "../../services/rag/ChatbotService";
 import { IUser } from "../../models/User";
 import { logRag } from "../../utils/logger";
+import { toUserError } from "../../utils/userFacingError";
 
 const router = Router();
 
@@ -50,9 +51,10 @@ router.post("/", authenticate, ragRateLimit("chat"), async (req: Request, res: R
         logRag({ endpoint: "chat", userId, query: parsed.data.message.slice(0, 100), latency_ms: Date.now() - t0, status: "ok" });
         sendEvent("done", { ok: true });
     } catch (err) {
-        const msg = err instanceof Error ? err.message : "Chat error";
-        logRag({ endpoint: "chat", userId, query: parsed.data.message.slice(0, 100), latency_ms: Date.now() - t0, status: "error", error: msg });
-        sendEvent("error", { message: msg });
+        const raw = err instanceof Error ? err.message : "Chat error";
+        logRag({ endpoint: "chat", userId, query: parsed.data.message.slice(0, 100), latency_ms: Date.now() - t0, status: "error", error: raw });
+        const friendly = toUserError(err);
+        sendEvent("error", { message: friendly.message, code: friendly.code });
     } finally {
         res.end();
     }
@@ -67,8 +69,9 @@ router.get("/history", authenticate, async (req: Request, res: Response) => {
         const history = await getChatbotService().getHistory(userId, limit);
         res.json({ messages: history });
     } catch (err) {
-        const msg = err instanceof Error ? err.message : "Error";
-        res.status(500).json({ error: msg });
+        console.error("[chat] history error:", err instanceof Error ? err.message : err);
+        const friendly = toUserError(err);
+        res.status(friendly.status).json({ error: friendly.message, code: friendly.code });
     }
 });
 
@@ -80,8 +83,9 @@ router.delete("/", authenticate, async (req: Request, res: Response) => {
         await getChatbotService().closeSession(userId);
         res.json({ ok: true });
     } catch (err) {
-        const msg = err instanceof Error ? err.message : "Error";
-        res.status(500).json({ error: msg });
+        console.error("[chat] close session error:", err instanceof Error ? err.message : err);
+        const friendly = toUserError(err);
+        res.status(friendly.status).json({ error: friendly.message, code: friendly.code });
     }
 });
 

@@ -9,6 +9,7 @@ import { getTranslationService } from "./TranslationService";
 import MealPlan from "../../models/MealPlan";
 import MealPlanItem from "../../models/MealPlanItem";
 import User from "../../models/User";
+import { trackAiUsage } from "../../utils/aiUsage";
 
 export type GoalType = "weight_loss" | "muscle_gain" | "maintenance";
 
@@ -197,6 +198,43 @@ const DayOutputSchema = z.object({
     meals: z.array(MealItemSchema).min(2).max(15),
 });
 
+// Multi-day batch output: same per-day meal schema wrapped in a `days` array
+const BatchDaySchema = z.object({
+    day_number: z.number().int().positive().optional(),
+    meals: z.array(MealItemSchema).min(2).max(15),
+});
+const BatchOutputSchema = z.object({
+    days: z.array(BatchDaySchema).min(1),
+});
+
+// Candidate pool fetched ONCE for the whole plan (vector searches + FatSecret
+// supplement hoisted out of the per-day loop). displayByMeal is index-aligned
+// with mealTypeCandidates entries and includes portion hints for the prompt.
+interface CandidatePool {
+    foodLookup: Map<string, { source_id: string; source_type: "food" | "recipe" | "usda" | "ai_generated"; fdc_id?: number }>;
+    mealTypeCandidates: MealTypeCandidates;
+    displayByMeal: Record<string, string[]>;
+    mealTypeTargets: Record<string, number>;
+}
+
+// Days per LLM call. 21 → 7×3; 7 → 3+3+1 (remainder chunk).
+const BATCH_SIZE = 3;
+// Per-day output budget; total per call capped at 8000 so the Gemini 2.0 Flash
+// fallback (8192 max output tokens) can still serve a full batch.
+const MAX_TOKENS_PER_DAY = 3500;
+const MAX_TOKENS_PER_CALL = 8000;
+
+// Shared example meal list used by both single-day and batch prompts
+const EXAMPLE_MEALS_JSON = `[
+  {"meal_type":"breakfast","food_name":"Phở bò","weight_grams":400,"calories":450,"protein":25,"carbs":60,"fat":12,"cooking_steps":["Đun nước dùng xương bò sôi","Chan nước nóng vào tô bún, bày thịt bò tái","Thêm hành lá, rau thơm, chanh, ớt"]},
+  {"meal_type":"snack","food_name":"Chuối","weight_grams":120,"calories":107,"protein":1,"carbs":27,"fat":0,"cooking_steps":["Bóc vỏ, ăn trực tiếp"]},
+  {"meal_type":"lunch","food_name":"Cơm trắng","weight_grams":200,"calories":260,"protein":5,"carbs":58,"fat":1,"cooking_steps":["Vo gạo sạch, nấu cơm tỉ lệ 1:1.5"]},
+  {"meal_type":"lunch","food_name":"Gà kho gừng","weight_grams":120,"calories":185,"protein":22,"carbs":3,"fat":9,"cooking_steps":["Ướp gà với gừng, nước mắm, đường 15 phút","Kho lửa vừa 20 phút đến khi nước sệt"]},
+  {"meal_type":"dinner","food_name":"Cơm trắng","weight_grams":180,"calories":234,"protein":4,"carbs":52,"fat":1,"cooking_steps":["Nấu cơm"]},
+  {"meal_type":"dinner","food_name":"Cá hồi áp chảo","weight_grams":150,"calories":250,"protein":30,"carbs":0,"fat":14,"cooking_steps":["Ướp cá với muối, tiêu, chanh 10 phút","Áp chảo mỗi mặt 3–4 phút lửa vừa"]},
+  {"meal_type":"dinner","food_name":"Canh rau ngót","weight_grams":200,"calories":45,"protein":3,"carbs":7,"fat":1,"cooking_steps":["Lặt rau, rửa sạch","Nấu sôi nước, cho rau vào 5 phút, nêm muối"]}
+]`;
+
 export class MealPlanGeneratorService {
     private readonly llm = getLLMService();
     private readonly search = getFoodSearchService();
@@ -277,6 +315,8 @@ export class MealPlanGeneratorService {
             is_approved: false,
             creator_id: new Types.ObjectId(req.userId),
         });
+        trackAiUsage("meal_plan");
+        trackAiUsage("meal_plan_day", req.duration_days);
 
         const recentFoodNames: string[] = [];
         const proteinSourceLog: string[] = [];
@@ -285,267 +325,73 @@ export class MealPlanGeneratorService {
         const sourceBreakdown = { usda: 0, recipe: 0, food: 0, ai_generated: 0 };
         const recipeIdsForEnrichment = new Set<string>();
 
-        for (let day = 1; day <= req.duration_days; day++) {
-            onProgress("progress", { current_day: day, total_days: req.duration_days });
+        // Fetch the candidate pool ONCE for the whole plan (vector + FatSecret),
+        // then generate days in batches of BATCH_SIZE per LLM call.
+        const allergyTerms = this._buildAllergyTerms(effectiveReq.preferences?.allergies);
+        const pool = await this._buildCandidatePool(dailyTargets, effectiveReq, allergyTerms);
 
-            let result: GenerateDayResult | null = null;
-            let attempts = 0;
+        const batches = this._chunkDays(req.duration_days, BATCH_SIZE);
+        for (const batchDays of batches) {
+            onProgress("progress", { current_day: batchDays[0], total_days: req.duration_days });
 
-            while (!result && attempts < 3) {
-                attempts++;
+            const proteinHints = batchDays.map((d, i) =>
+                i === 0 && nextDayProteinHint
+                    ? nextDayProteinHint
+                    : PROTEIN_ROTATIONS[(d - 1) % PROTEIN_ROTATIONS.length]);
+
+            // Batch generation: 1 retry per batch (correction attempt handled inside)
+            let batchPlans: (DayPlan | null)[] | null = null;
+            for (let attempt = 1; attempt <= 2 && !batchPlans; attempt++) {
                 try {
-                    result = await this._generateDay(
-                        day,
-                        dailyTargets,
-                        effectiveReq,
-                        recentFoodNames,
-                        attempts,
-                        userBio,
-                        nextDayProteinHint,
+                    batchPlans = await this._generateBatch(
+                        batchDays, dailyTargets, effectiveReq, pool, recentFoodNames,
+                        attempt, userBio, proteinHints, allergyTerms,
                     );
                 } catch (err) {
                     const msg = err instanceof Error ? err.message : String(err);
-                    console.error(`[MealPlanGenerator] Day ${day} attempt ${attempts} failed:`, msg, { userId: req.userId, goal: req.goal, mealsPerDay: req.meals_per_day });
+                    console.error(`[MealPlanGenerator] Batch days ${batchDays.join(",")} attempt ${attempt} failed:`, msg, { userId: req.userId, goal: req.goal, mealsPerDay: req.meals_per_day });
                 }
             }
+            if (!batchPlans) batchPlans = batchDays.map(() => null);
 
-            if (!result) continue;
+            for (let i = 0; i < batchDays.length; i++) {
+                const day = batchDays[i];
+                if (i > 0) onProgress("progress", { current_day: day, total_days: req.duration_days });
 
-            let { plan: dayPlan, mealTypeCandidates } = result;
+                let dayPlan = batchPlans[i];
+                let dayCandidates = pool.mealTypeCandidates;
 
-            // TASK 4: Sync enrich USDA items → create real Food records from USDA data
-            const usdaMeals = dayPlan.meals.filter((m) => m.source_type === "usda" && m.fdc_id != null);
-            // UsdaFood source_id → enriched Recipe._id (processJob now returns Recipe._id)
-            const enrichedRecipeIds = new Map<string, Types.ObjectId>();
-            if (usdaMeals.length > 0) {
-                const chunkSize = 5;
-                for (let ci = 0; ci < usdaMeals.length; ci += chunkSize) {
-                    const chunk = usdaMeals.slice(ci, ci + chunkSize);
-                    await Promise.all(
-                        chunk.map(async (m) => {
-                            try {
-                                const recipeObjId = await this.enrichment.processJob(m.fdc_id!, false);
-                                if (recipeObjId && m.food_id) {
-                                    enrichedRecipeIds.set(m.food_id, recipeObjId);
-                                }
-                            } catch (err) {
-                                console.warn(`[MealPlanGenerator] Sync enrich fdc_id=${m.fdc_id}:`, err instanceof Error ? err.message : String(err));
-                            }
-                        }),
-                    );
-                }
-            }
-
-            const itemsToInsert: object[] = [];
-            console.log(`[MealPlanGenerator] Day ${day}: LLM returned ${dayPlan.meals.length} meals`);
-            for (let i = 0; i < dayPlan.meals.length; i++) {
-                let meal = dayPlan.meals[i];
-                let recipe_id: Types.ObjectId | undefined;
-                let food_id: Types.ObjectId | undefined;
-                let usda_food_id: Types.ObjectId | undefined;
-                let source_type: string | undefined;
-                let custom_food: {
-                    name: string;
-                    calories_kcal: number;
-                    protein_g: number;
-                    carbs_g: number;
-                    fat_g: number;
-                    fiber_g?: number;
-                    serving_description?: string;
-                    description?: string;
-                } | undefined;
-
-                if (meal.food_id && meal.source_type) {
-                    source_type = meal.source_type;
-                    if (meal.source_type === "recipe") {
-                        recipe_id = new Types.ObjectId(meal.food_id);
-                    } else if (meal.source_type === "usda") {
-                        usda_food_id = new Types.ObjectId(meal.food_id);
-                        const enriched = enrichedRecipeIds.get(meal.food_id);
-                        if (enriched) {
-                            recipe_id = enriched; // enriched USDA dish → Recipe._id
-                        }
-                    } else if (meal.source_type === "ai_generated") {
-                        custom_food = this._toCustomFood(meal);
-                    } else {
-                        food_id = new Types.ObjectId(meal.food_id);
-                    }
-                } else {
-                    // LLM invented a name not in the DB lookup.
-                    // Use the top real candidate and override calories/macros with its
-                    // actual DB nutrition to avoid serving hallucinated nutritional data.
-                    const fallback = mealTypeCandidates.get(meal.meal_type)?.[0];
-                    if (!fallback) {
-                        console.warn(`[MealPlanGenerator] Day ${day} ${meal.meal_type}: no DB candidate, skipping meal`);
-                        continue;
-                    }
-                    dayPlan.substitutions.push(`"${meal.food_name}" → "${fallback.name}"`);
-                    source_type = fallback.source_type;
-                    if (fallback.source_type === "recipe") {
-                        recipe_id = new Types.ObjectId(fallback.source_id);
-                    } else if (fallback.source_type === "usda") {
-                        usda_food_id = new Types.ObjectId(fallback.source_id);
-                    } else if (fallback.source_type === "ai_generated") {
-                        custom_food = this._toCustomFood({
-                            ...meal,
-                            food_name: fallback.name,
-                            source_type: "ai_generated",
-                        });
-                    } else {
-                        food_id = new Types.ObjectId(fallback.source_id);
-                    }
-                    // Override LLM-invented nutrition with verified DB values
-                    if (fallback.energy_kcal != null) {
-                        meal = {
-                            ...meal,
-                            food_name: fallback.name,
-                            calories: Math.round((fallback.energy_kcal ?? 0) * meal.weight_grams / 100),
-                            protein: Math.round((fallback.protein ?? 0) * meal.weight_grams / 100 * 10) / 10,
-                            carbs:   Math.round((fallback.carbs   ?? 0) * meal.weight_grams / 100 * 10) / 10,
-                            fat:     Math.round((fallback.fat     ?? 0) * meal.weight_grams / 100 * 10) / 10,
-                        };
-                        if (fallback.source_type === "ai_generated") {
-                            custom_food = this._toCustomFood(meal);
+                // Repair path: regenerate ONLY this day with the single-day call
+                // (attempt 2 = higher temp; attempt 3 tolerates deviation → scaling)
+                if (!dayPlan) {
+                    for (let attempt = 2; attempt <= 3 && !dayPlan; attempt++) {
+                        try {
+                            const repaired = await this._generateDay(
+                                day, dailyTargets, effectiveReq, recentFoodNames,
+                                attempt, userBio, proteinHints[i],
+                            );
+                            dayPlan = repaired.plan;
+                            dayCandidates = repaired.mealTypeCandidates;
+                        } catch (err) {
+                            const msg = err instanceof Error ? err.message : String(err);
+                            console.error(`[MealPlanGenerator] Day ${day} repair attempt ${attempt} failed:`, msg, { userId: req.userId, goal: req.goal, mealsPerDay: req.meals_per_day });
                         }
                     }
                 }
+                if (!dayPlan) continue;
 
-                if (source_type === "ai_generated" && !custom_food) {
-                    custom_food = this._toCustomFood(meal);
-                }
+                const finalized = await this._persistAndEmitDay(
+                    day, dayPlan, dayCandidates, plan._id as Types.ObjectId, dailyTargets,
+                    sourceBreakdown, recipeIdsForEnrichment, proteinSourceLog, onProgress,
+                );
+                if (!finalized.ok) continue;
 
-                // Track source breakdown for logging
-                const st = (source_type ?? "ai_generated") as keyof typeof sourceBreakdown;
-                sourceBreakdown[st] = (sourceBreakdown[st] ?? 0) + 1;
-
-                if (recipe_id) recipeIdsForEnrichment.add(recipe_id.toString());
-
-                itemsToInsert.push({
-                    meal_plan_id: plan._id,
-                    day_number: day,
-                    meal_type: meal.meal_type,
-                    recipe_id,
-                    food_id,
-                    usda_food_id,
-                    custom_food,
-                    source_type,
-                    serving_size: meal.weight_grams,
-                    calories: meal.calories,
-                    sort_order: i,
-                });
+                days.push(finalized.dayPlan);
+                recentFoodNames.push(...finalized.dayPlan.meals.map((m) => m.food_name));
+                // Keep up to 120 recent names (21 days × 5 meals = 105 + buffer).
+                if (recentFoodNames.length > 120) recentFoodNames.splice(0, 10);
+                nextDayProteinHint = finalized.nextDayProteinHint;
             }
-
-            if (itemsToInsert.length === 0) {
-                console.warn(`[MealPlanGenerator] Day ${day}: 0 items to insert — all meals skipped (no DB candidates). Check vector store has data.`);
-                continue;
-            }
-
-            // Scale serving sizes BEFORE commit so stored data is already calibrated
-            const { meals: adjustedMeals, scaleFactor } = this._adjustDayCalories(dayPlan.meals, dailyTargets, day);
-            if (scaleFactor !== 1) {
-                const typedItems = itemsToInsert as Array<{
-                    serving_size: number;
-                    calories: number;
-                    custom_food?: {
-                        calories_kcal: number;
-                        protein_g: number;
-                        carbs_g: number;
-                        fat_g: number;
-                        serving_description?: string;
-                    };
-                }>;
-                for (let idx = 0; idx < typedItems.length; idx++) {
-                    const item = typedItems[idx];
-                    const adjustedMeal = adjustedMeals[idx];
-                    item.serving_size = adjustedMeal?.weight_grams ?? Math.round(item.serving_size * scaleFactor);
-                    item.calories = adjustedMeal?.calories ?? Math.round(item.calories * scaleFactor);
-                    if (item.custom_food && adjustedMeal) {
-                        item.custom_food.calories_kcal = adjustedMeal.calories;
-                        item.custom_food.protein_g = adjustedMeal.protein;
-                        item.custom_food.carbs_g = adjustedMeal.carbs;
-                        item.custom_food.fat_g = adjustedMeal.fat;
-                        item.custom_food.serving_description = `${adjustedMeal.weight_grams}g`;
-                    }
-                }
-                dayPlan = {
-                    ...dayPlan,
-                    meals: adjustedMeals,
-                    day_totals: {
-                        calories: adjustedMeals.reduce((s, m) => s + m.calories, 0),
-                        protein:  adjustedMeals.reduce((s, m) => s + m.protein,  0),
-                        carbs:    adjustedMeals.reduce((s, m) => s + m.carbs,    0),
-                        fat:      adjustedMeals.reduce((s, m) => s + m.fat,      0),
-                    },
-                };
-            }
-
-            // Auto-add high-fiber item if day is fiber-deficient (requires actual fiber data from DB)
-            const fiberCandidate = this._findHighFiberCandidate(mealTypeCandidates, dayPlan.meals);
-            if (fiberCandidate) {
-                const fw = 150;
-                const fcal = Math.round((fiberCandidate.energy_kcal ?? 0) * fw / 100);
-                dayPlan.meals.push({
-                    meal_type: "dinner",
-                    food_name: fiberCandidate.name,
-                    food_id: fiberCandidate.source_id,
-                    source_type: fiberCandidate.source_type,
-                    weight_grams: fw,
-                    calories: fcal,
-                    protein: Math.round((fiberCandidate.protein ?? 0) * fw / 100 * 10) / 10,
-                    carbs:   Math.round((fiberCandidate.carbs   ?? 0) * fw / 100 * 10) / 10,
-                    fat:     Math.round((fiberCandidate.fat     ?? 0) * fw / 100 * 10) / 10,
-                });
-                const fiberRef = fiberCandidate.source_type === "recipe"
-                    ? { recipe_id: new Types.ObjectId(fiberCandidate.source_id) }
-                    : { food_id: new Types.ObjectId(fiberCandidate.source_id) };
-                itemsToInsert.push({
-                    meal_plan_id: plan._id,
-                    day_number: day,
-                    meal_type: "dinner",
-                    ...fiberRef,
-                    source_type: fiberCandidate.source_type,
-                    serving_size: fw,
-                    calories: fcal,
-                    sort_order: itemsToInsert.length,
-                });
-                console.log(`[MealPlanAudit] Day ${day}: added high-fiber item "${fiberCandidate.name}" (fiber~${fiberCandidate.fiber?.toFixed(1)}g/100g)`);
-            }
-
-            await MealPlanItem.insertMany(itemsToInsert);
-
-            // Protein diversity: track source, log streak, override hint for next day
-            const dayProtein = this._detectProteinSource(dayPlan.meals);
-            proteinSourceLog.push(dayProtein);
-            if (proteinSourceLog.length >= 3 &&
-                proteinSourceLog[proteinSourceLog.length - 1] === dayProtein &&
-                proteinSourceLog[proteinSourceLog.length - 2] === dayProtein &&
-                dayProtein !== "other") {
-                const avoid: Record<string, string[]> = {
-                    poultry: ["shrimp seafood", "beef tofu", "eggs legumes beans", "salmon tuna"],
-                    beef:    ["chicken white fish", "shrimp seafood", "eggs legumes beans", "salmon tuna"],
-                    pork:    ["chicken white fish", "shrimp seafood", "beef tofu", "duck mushroom"],
-                    fish:    ["shrimp seafood", "beef tofu", "eggs legumes beans", "pork crab"],
-                    seafood: ["chicken white fish", "beef tofu", "eggs legumes beans", "salmon tuna"],
-                    egg:     ["chicken white fish", "shrimp seafood", "beef tofu", "salmon tuna"],
-                    legume:  ["chicken white fish", "shrimp seafood", "pork crab", "duck mushroom"],
-                };
-                const options = avoid[dayProtein] ?? PROTEIN_ROTATIONS;
-                nextDayProteinHint = options[day % options.length];
-                console.log(`[MealPlanGenerator] Day ${day}: protein "${dayProtein}" 3-day streak — next day hint: "${nextDayProteinHint}"`);
-            } else {
-                nextDayProteinHint = undefined;
-            }
-
-            days.push(dayPlan);
-            recentFoodNames.push(...dayPlan.meals.map((m) => m.food_name));
-            // Keep up to 120 recent names (21 days × 5 meals = 105 + buffer).
-            if (recentFoodNames.length > 120) recentFoodNames.splice(0, 10);
-
-            onProgress("day", {
-                day_number: day,
-                plan: dayPlan,
-                substitutions: dayPlan.substitutions,
-            });
         }
 
         if (days.length !== req.duration_days) {
@@ -564,6 +410,635 @@ export class MealPlanGeneratorService {
         const planId = (plan._id as Types.ObjectId).toString();
         onProgress("done", { meal_plan_id: planId, days_generated: days.length, source_breakdown: sourceBreakdown });
         return { planId, source_breakdown: sourceBreakdown };
+    }
+
+    // Split 1..duration into consecutive chunks of `size` (e.g. 7 → [1-3],[4-6],[7])
+    private _chunkDays(duration: number, size: number): number[][] {
+        const chunks: number[][] = [];
+        for (let start = 1; start <= duration; start += size) {
+            const chunk: number[] = [];
+            for (let d = start; d <= Math.min(start + size - 1, duration); d++) chunk.push(d);
+            chunks.push(chunk);
+        }
+        return chunks;
+    }
+
+    // Persist one validated day (items, calorie scaling, fiber top-up, protein
+    // streak tracking) and emit the per-day SSE event. USDA enrichment is
+    // fire-and-forget — it must never block generation.
+    private async _persistAndEmitDay(
+        day: number,
+        dayPlanIn: DayPlan,
+        mealTypeCandidates: MealTypeCandidates,
+        planId: Types.ObjectId,
+        dailyTargets: NutritionTotals,
+        sourceBreakdown: { usda: number; recipe: number; food: number; ai_generated: number },
+        recipeIdsForEnrichment: Set<string>,
+        proteinSourceLog: string[],
+        onProgress: (event: "progress" | "day" | "done" | "error", data: unknown) => void,
+    ): Promise<{ ok: boolean; dayPlan: DayPlan; nextDayProteinHint?: string }> {
+        let dayPlan = dayPlanIn;
+
+        // USDA enrichment moved OFF the critical path: fire-and-forget.
+        // Meals keep their usda_food_id reference; the enriched Recipe is
+        // created in the background for future plans/searches.
+        for (const m of dayPlan.meals) {
+            if (m.source_type === "usda" && m.fdc_id != null) {
+                void this.enrichment.processJob(m.fdc_id, false).catch((err) =>
+                    console.warn(`[MealPlanGenerator] Background enrich fdc_id=${m.fdc_id}:`, err instanceof Error ? err.message : String(err)));
+            }
+        }
+
+        const itemsToInsert: object[] = [];
+        console.log(`[MealPlanGenerator] Day ${day}: LLM returned ${dayPlan.meals.length} meals`);
+        for (let i = 0; i < dayPlan.meals.length; i++) {
+            let meal = dayPlan.meals[i];
+            let recipe_id: Types.ObjectId | undefined;
+            let food_id: Types.ObjectId | undefined;
+            let usda_food_id: Types.ObjectId | undefined;
+            let source_type: string | undefined;
+            let custom_food: {
+                name: string;
+                calories_kcal: number;
+                protein_g: number;
+                carbs_g: number;
+                fat_g: number;
+                fiber_g?: number;
+                serving_description?: string;
+                description?: string;
+            } | undefined;
+
+            if (meal.food_id && meal.source_type) {
+                source_type = meal.source_type;
+                if (meal.source_type === "recipe") {
+                    recipe_id = new Types.ObjectId(meal.food_id);
+                } else if (meal.source_type === "usda") {
+                    usda_food_id = new Types.ObjectId(meal.food_id);
+                } else if (meal.source_type === "ai_generated") {
+                    custom_food = this._toCustomFood(meal);
+                } else {
+                    food_id = new Types.ObjectId(meal.food_id);
+                }
+            } else {
+                // LLM invented a name not in the DB lookup.
+                // Use the top real candidate and override calories/macros with its
+                // actual DB nutrition to avoid serving hallucinated nutritional data.
+                const fallback = mealTypeCandidates.get(meal.meal_type)?.[0];
+                if (!fallback) {
+                    console.warn(`[MealPlanGenerator] Day ${day} ${meal.meal_type}: no DB candidate, skipping meal`);
+                    continue;
+                }
+                dayPlan.substitutions.push(`"${meal.food_name}" → "${fallback.name}"`);
+                source_type = fallback.source_type;
+                if (fallback.source_type === "recipe") {
+                    recipe_id = new Types.ObjectId(fallback.source_id);
+                } else if (fallback.source_type === "usda") {
+                    usda_food_id = new Types.ObjectId(fallback.source_id);
+                } else if (fallback.source_type === "ai_generated") {
+                    custom_food = this._toCustomFood({
+                        ...meal,
+                        food_name: fallback.name,
+                        source_type: "ai_generated",
+                    });
+                } else {
+                    food_id = new Types.ObjectId(fallback.source_id);
+                }
+                // Override LLM-invented nutrition with verified DB values
+                if (fallback.energy_kcal != null) {
+                    meal = {
+                        ...meal,
+                        food_name: fallback.name,
+                        calories: Math.round((fallback.energy_kcal ?? 0) * meal.weight_grams / 100),
+                        protein: Math.round((fallback.protein ?? 0) * meal.weight_grams / 100 * 10) / 10,
+                        carbs:   Math.round((fallback.carbs   ?? 0) * meal.weight_grams / 100 * 10) / 10,
+                        fat:     Math.round((fallback.fat     ?? 0) * meal.weight_grams / 100 * 10) / 10,
+                    };
+                    if (fallback.source_type === "ai_generated") {
+                        custom_food = this._toCustomFood(meal);
+                    }
+                }
+            }
+
+            if (source_type === "ai_generated" && !custom_food) {
+                custom_food = this._toCustomFood(meal);
+            }
+
+            // Track source breakdown for logging
+            const st = (source_type ?? "ai_generated") as keyof typeof sourceBreakdown;
+            sourceBreakdown[st] = (sourceBreakdown[st] ?? 0) + 1;
+
+            if (recipe_id) recipeIdsForEnrichment.add(recipe_id.toString());
+
+            itemsToInsert.push({
+                meal_plan_id: planId,
+                day_number: day,
+                meal_type: meal.meal_type,
+                recipe_id,
+                food_id,
+                usda_food_id,
+                custom_food,
+                source_type,
+                serving_size: meal.weight_grams,
+                calories: meal.calories,
+                sort_order: i,
+            });
+        }
+
+        if (itemsToInsert.length === 0) {
+            console.warn(`[MealPlanGenerator] Day ${day}: 0 items to insert — all meals skipped (no DB candidates). Check vector store has data.`);
+            return { ok: false, dayPlan };
+        }
+
+        // Scale serving sizes BEFORE commit so stored data is already calibrated
+        const { meals: adjustedMeals, scaleFactor } = this._adjustDayCalories(dayPlan.meals, dailyTargets, day);
+        if (scaleFactor !== 1) {
+            const typedItems = itemsToInsert as Array<{
+                serving_size: number;
+                calories: number;
+                custom_food?: {
+                    calories_kcal: number;
+                    protein_g: number;
+                    carbs_g: number;
+                    fat_g: number;
+                    serving_description?: string;
+                };
+            }>;
+            for (let idx = 0; idx < typedItems.length; idx++) {
+                const item = typedItems[idx];
+                const adjustedMeal = adjustedMeals[idx];
+                item.serving_size = adjustedMeal?.weight_grams ?? Math.round(item.serving_size * scaleFactor);
+                item.calories = adjustedMeal?.calories ?? Math.round(item.calories * scaleFactor);
+                if (item.custom_food && adjustedMeal) {
+                    item.custom_food.calories_kcal = adjustedMeal.calories;
+                    item.custom_food.protein_g = adjustedMeal.protein;
+                    item.custom_food.carbs_g = adjustedMeal.carbs;
+                    item.custom_food.fat_g = adjustedMeal.fat;
+                    item.custom_food.serving_description = `${adjustedMeal.weight_grams}g`;
+                }
+            }
+            dayPlan = {
+                ...dayPlan,
+                meals: adjustedMeals,
+                day_totals: {
+                    calories: adjustedMeals.reduce((s, m) => s + m.calories, 0),
+                    protein:  adjustedMeals.reduce((s, m) => s + m.protein,  0),
+                    carbs:    adjustedMeals.reduce((s, m) => s + m.carbs,    0),
+                    fat:      adjustedMeals.reduce((s, m) => s + m.fat,      0),
+                },
+            };
+        }
+
+        // Auto-add high-fiber item if day is fiber-deficient (requires actual fiber data from DB)
+        const fiberCandidate = this._findHighFiberCandidate(mealTypeCandidates, dayPlan.meals);
+        if (fiberCandidate) {
+            const fw = 150;
+            const fcal = Math.round((fiberCandidate.energy_kcal ?? 0) * fw / 100);
+            dayPlan.meals.push({
+                meal_type: "dinner",
+                food_name: fiberCandidate.name,
+                food_id: fiberCandidate.source_id,
+                source_type: fiberCandidate.source_type,
+                weight_grams: fw,
+                calories: fcal,
+                protein: Math.round((fiberCandidate.protein ?? 0) * fw / 100 * 10) / 10,
+                carbs:   Math.round((fiberCandidate.carbs   ?? 0) * fw / 100 * 10) / 10,
+                fat:     Math.round((fiberCandidate.fat     ?? 0) * fw / 100 * 10) / 10,
+            });
+            const fiberRef = fiberCandidate.source_type === "recipe"
+                ? { recipe_id: new Types.ObjectId(fiberCandidate.source_id) }
+                : { food_id: new Types.ObjectId(fiberCandidate.source_id) };
+            itemsToInsert.push({
+                meal_plan_id: planId,
+                day_number: day,
+                meal_type: "dinner",
+                ...fiberRef,
+                source_type: fiberCandidate.source_type,
+                serving_size: fw,
+                calories: fcal,
+                sort_order: itemsToInsert.length,
+            });
+            console.log(`[MealPlanAudit] Day ${day}: added high-fiber item "${fiberCandidate.name}" (fiber~${fiberCandidate.fiber?.toFixed(1)}g/100g)`);
+        }
+
+        await MealPlanItem.insertMany(itemsToInsert);
+
+        // Protein diversity: track source, log streak, override hint for next day
+        let nextDayProteinHint: string | undefined;
+        const dayProtein = this._detectProteinSource(dayPlan.meals);
+        proteinSourceLog.push(dayProtein);
+        if (proteinSourceLog.length >= 3 &&
+            proteinSourceLog[proteinSourceLog.length - 1] === dayProtein &&
+            proteinSourceLog[proteinSourceLog.length - 2] === dayProtein &&
+            dayProtein !== "other") {
+            const avoid: Record<string, string[]> = {
+                poultry: ["shrimp seafood", "beef tofu", "eggs legumes beans", "salmon tuna"],
+                beef:    ["chicken white fish", "shrimp seafood", "eggs legumes beans", "salmon tuna"],
+                pork:    ["chicken white fish", "shrimp seafood", "beef tofu", "duck mushroom"],
+                fish:    ["shrimp seafood", "beef tofu", "eggs legumes beans", "pork crab"],
+                seafood: ["chicken white fish", "beef tofu", "eggs legumes beans", "salmon tuna"],
+                egg:     ["chicken white fish", "shrimp seafood", "beef tofu", "salmon tuna"],
+                legume:  ["chicken white fish", "shrimp seafood", "pork crab", "duck mushroom"],
+            };
+            const options = avoid[dayProtein] ?? PROTEIN_ROTATIONS;
+            nextDayProteinHint = options[day % options.length];
+            console.log(`[MealPlanGenerator] Day ${day}: protein "${dayProtein}" 3-day streak — next day hint: "${nextDayProteinHint}"`);
+        }
+
+        // SSE contract: one `day` event per day, same shape as before
+        onProgress("day", {
+            day_number: day,
+            plan: dayPlan,
+            substitutions: dayPlan.substitutions,
+        });
+
+        return { ok: true, dayPlan, nextDayProteinHint };
+    }
+
+    // Fetch the candidate pool ONCE for the whole plan: per-meal-type vector
+    // searches with a larger top_k plus a single FatSecret supplement pass for
+    // sparse meal types. Adapted from the old per-day retrieval in _generateDay.
+    private async _buildCandidatePool(
+        targets: NutritionTotals,
+        req: GenerateMealPlanRequest,
+        allergyTerms: string[],
+    ): Promise<CandidatePool> {
+        const foodLookup: CandidatePool["foodLookup"] = new Map();
+        const mealTypeCandidates: MealTypeCandidates = new Map();
+        const displayByMeal: Record<string, string[]> = {};
+        const mealTypeTargets: Record<string, number> = {};
+
+        const mealConfig = MEAL_CONFIGS[req.meals_per_day ?? 4];
+        const cookingHint = req.cooking_style === "batch" ? "batch-cook one-pot reheat" : "fresh quick-prep";
+        // Whole-plan pool: include the full protein rotation vocabulary so one
+        // query returns a varied set covering every rotation slot.
+        const proteinTerms = PROTEIN_ROTATIONS.join(" ");
+
+        const searchResults = await Promise.all(
+            mealConfig.types.map((mealType) => {
+                const targetCal = Math.round(targets.calories * (mealConfig.dist[mealType] ?? 0.25));
+                const query = `${mealType} ${req.preferences?.cuisine_preferences?.[0] ?? "Vietnamese"} ${GOAL_HINTS[req.goal]} ${cookingHint} ${proteinTerms} ${targetCal}kcal`;
+                return this.search.search({
+                    query,
+                    top_k: 20, // ~2.5x the old per-day top_k 8 — one pool serves the whole plan
+                    include_sources: ["food", "recipe", "usda"],
+                    user_preferences: req.preferences as import("./FoodSearchService").UserPreferences | undefined,
+                }).then((results) => ({
+                    mealType,
+                    results: results.filter((r) => !this._containsBlockedAllergen(r.name, allergyTerms)),
+                }));
+            }),
+        );
+
+        // P0-5: Keep generation alive with starter candidates so early/dev DBs
+        // do not make the core meal-plan feature feel broken.
+        const allEmpty = searchResults.every(({ results }) => results.length === 0);
+        if (allEmpty) {
+            console.warn("[MealPlanGenerator] Candidate pool: all vector candidates empty — using starter AI-generated candidates.");
+        }
+
+        for (const { mealType, results } of searchResults) {
+            mealTypeTargets[mealType] = Math.round(targets.calories * (mealConfig.dist[mealType] ?? 0.25));
+
+            const typedCandidates: CandidateEntry[] = [];
+            const displays: string[] = [];
+
+            for (const r of results) {
+                if (!r.name) continue;
+                const portionHint = r.portions?.[0] ? ` [${r.portions[0].description}=${r.portions[0].gram_weight}g]` : "";
+                const entry = {
+                    source_id: r.source_id,
+                    source_type: r.source_type as "food" | "recipe" | "usda",
+                    fdc_id: r.fdc_id,
+                };
+                foodLookup.set(r.name.toLowerCase(), entry);
+                if (portionHint) foodLookup.set((r.name + portionHint).toLowerCase(), entry);
+
+                // Store actual DB nutrition so fallback meals use verified data
+                typedCandidates.push({
+                    source_id: r.source_id,
+                    source_type: entry.source_type,
+                    name: r.name,
+                    energy_kcal: r.energy_kcal,
+                    protein: r.protein,
+                    carbs: r.glucid,
+                    fat: r.lipid,
+                    fiber: (r as any).fiber,
+                });
+                displays.push(r.name + portionHint);
+            }
+
+            if (typedCandidates.length === 0) {
+                const starterCandidates = this._starterCandidatesForMeal(mealType, req, allergyTerms);
+                for (const starter of starterCandidates) {
+                    foodLookup.set(starter.name.toLowerCase(), {
+                        source_id: starter.source_id,
+                        source_type: starter.source_type,
+                    });
+                    foodLookup.set(`${starter.name} [ước tính]`.toLowerCase(), {
+                        source_id: starter.source_id,
+                        source_type: starter.source_type,
+                    });
+                    typedCandidates.push(starter);
+                    displays.push(`${starter.name} [ước tính]`);
+                }
+            }
+
+            mealTypeCandidates.set(mealType, typedCandidates);
+            displayByMeal[mealType] = displays;
+            if (typedCandidates.length === 0) {
+                console.warn(`[MealPlanGenerator] Candidate pool ${mealType}: 0 candidates from vector search. Vector store may be empty.`);
+            }
+        }
+
+        // FatSecret supplement — runs ONCE per plan, only for meal types that
+        // still have 0 candidates. Upserts to local Food DB so items get real _ids.
+        if (FatSecretImportService.isAvailable()) {
+            const sparseTypes = mealConfig.types.filter(
+                (mt) => (mealTypeCandidates.get(mt)?.length ?? 0) === 0,
+            );
+            if (sparseTypes.length > 0) {
+                const fsService  = getFatSecretService();
+                const fsImport   = getFatSecretImportService();
+                const translation = getTranslationService();
+
+                await Promise.all(
+                    sparseTypes.map(async (mealType) => {
+                        try {
+                            const mealHint = mealType.includes("snack") ? "snack" : mealType;
+                            const query = `${mealHint} Vietnamese ${GOAL_HINTS[req.goal]}`;
+                            const FATSECRET_TIMEOUT_MS = 3000;
+                            const fsItems = await Promise.race([
+                                fsService.searchFoodsV5(query, 8),
+                                new Promise<never>((_, reject) =>
+                                    setTimeout(() => reject(new Error("FatSecret timeout")), FATSECRET_TIMEOUT_MS),
+                                ),
+                            ]);
+                            if (fsItems.length === 0) return;
+
+                            // Translate English FatSecret names → Vietnamese in one batch
+                            const enNames = fsItems.map((f) => f.food_name);
+                            let viNames = enNames;
+                            try {
+                                viNames = await translation.translateBatch(enNames);
+                            } catch { /* keep English on failure */ }
+
+                            const typedCandidates = mealTypeCandidates.get(mealType) ?? [];
+                            const displays = displayByMeal[mealType] ?? [];
+
+                            for (let i = 0; i < fsItems.length; i++) {
+                                const fs     = fsItems[i];
+                                const viName = viNames[i] || fs.food_name;
+                                if (this._containsBlockedAllergen(`${viName} ${fs.food_name}`, allergyTerms)) continue;
+                                // Upsert synchronously so we get a real MongoDB _id
+                                const food = await fsImport.upsertFromV5Food(fs, viName);
+                                if (!food) continue;
+
+                                const entry = {
+                                    source_id:   (food._id as Types.ObjectId).toString(),
+                                    source_type: "food" as const,
+                                };
+                                foodLookup.set(viName.toLowerCase(), entry);
+                                foodLookup.set(fs.food_name.toLowerCase(), entry);
+                                typedCandidates.push({ ...entry, name: viName });
+                                displays.push(viName);
+                            }
+
+                            mealTypeCandidates.set(mealType, typedCandidates);
+                            displayByMeal[mealType] = displays;
+                        } catch (err) {
+                            console.warn(
+                                `[MealPlanGenerator] FatSecret supplement for ${mealType} failed:`,
+                                err instanceof Error ? err.message : String(err),
+                            );
+                        }
+                    }),
+                );
+            }
+        }
+
+        return { foodLookup, mealTypeCandidates, displayByMeal, mealTypeTargets };
+    }
+
+    // Build the per-batch candidate block: prefer names not yet used in the plan
+    // so consecutive batches see fresh options; refill with used ones if sparse.
+    private _candidateBlockFor(pool: CandidatePool, usedNames: string[]): string {
+        const used = new Set(usedNames.map((n) => this._normalizeText(n)));
+        return Object.entries(pool.displayByMeal)
+            .map(([mealType, displays]) => {
+                const entries = pool.mealTypeCandidates.get(mealType) ?? [];
+                const fresh: string[] = [];
+                const alreadyUsed: string[] = [];
+                displays.forEach((display, i) => {
+                    const name = entries[i]?.name ?? display;
+                    (used.has(this._normalizeText(name)) ? alreadyUsed : fresh).push(display);
+                });
+                const chosen = (fresh.length >= 6 ? fresh : [...fresh, ...alreadyUsed]).slice(0, 16);
+                return `[${mealType} — ~${pool.mealTypeTargets[mealType]}kcal]\n${chosen.join("; ")}`;
+            })
+            .join("\n\n");
+    }
+
+    // Shared prompt rules for single-day and batch prompts (batch adds rules 8–9)
+    private _buildRulesBlock(avoidLine: string, batchDayNumbers?: number[]): string {
+        const base = `QUY TẮC BẮT BUỘC:
+1. food_name copy CHÍNH XÁC từ danh sách (kể cả [...] nếu có)
+2. Calories/protein/carbs/fat = TỔNG cho khẩu phần (không phải per 100g)
+3. SỐ MÓN THEO TỪNG BỮA (văn hóa VN thực tế):
+   · breakfast: 1 món đơn lẻ (phở/bún/bánh mì/cháo/xôi/cơm tấm — CHỈ 1 dòng)
+   · morning_snack / afternoon_snack / snack: 1 món nhẹ (trái cây/sữa chua/hạt/sữa)
+   · lunch: 1–2 món (1 đơn lẻ HOẶC cơm + 1 protein)
+   · dinner: 2–3 món (cơm + protein + canh/rau — lặp meal_type để thêm)
+4. cooking_steps: 2–4 bước nấu ngắn gọn thực tế bằng tiếng Việt
+5. Tổng calories mỗi bữa ±20% mục tiêu
+6. Đa dạng nguồn protein, không lặp cùng loại đạm trong ngày
+7. TUYỆT ĐỐI không chọn món chứa dị ứng/kiêng bắt buộc của người dùng${avoidLine}`;
+        if (!batchDayNumbers) return base;
+        return `${base}
+8. Trả về ĐÚNG ${batchDayNumbers.length} ngày trong mảng "days", day_number lần lượt: ${batchDayNumbers.join(", ")}
+9. KHÔNG lặp lại món chính (bữa trưa/tối) giữa các ngày trong cùng phản hồi — đổi nguồn đạm theo gợi ý từng ngày`;
+    }
+
+    // Parse LLM JSON output against a schema, giving the model ONE correction
+    // chance before throwing to the caller's retry loop.
+    private async _parseWithCorrection<S extends z.ZodTypeAny>(
+        schema: S,
+        messages: LLMMessage[],
+        firstContent: string,
+        label: string,
+        maxTokens: number,
+    ): Promise<z.infer<S>> {
+        const cleanJson = (raw: string) => raw.trim().replace(/^```json\s*/i, "").replace(/```\s*$/i, "").trim();
+        const text = cleanJson(firstContent);
+        try {
+            return schema.parse(JSON.parse(text));
+        } catch {
+            console.warn(`[MealPlanGenerator] ${label} JSON parse failed — sending correction. Raw (200): ${text.slice(0, 200)}`);
+            const correctionMessages: LLMMessage[] = [
+                ...messages,
+                { role: "assistant", content: firstContent },
+                { role: "user", content: "Phản hồi trên không phải JSON hợp lệ. Trả về JSON thuần túy duy nhất, bắt đầu bằng { và kết thúc bằng }, không có markdown, không có giải thích." },
+            ];
+            const correctionResp = await this.llm.generate(correctionMessages, { temperature: 0.1, maxTokens });
+            const correctedText = cleanJson(correctionResp.content);
+            try {
+                return schema.parse(JSON.parse(correctedText));
+            } catch (parseErr) {
+                console.error(`[MealPlanGenerator] ${label} JSON still invalid after correction. Raw (500): ${correctedText.slice(0, 500)}`);
+                throw parseErr;
+            }
+        }
+    }
+
+    // Recalculate calories from macros (ground truth) and correct LLM's reported
+    // values. LLM often reports calories independently of macros; macros are more reliable.
+    private _correctMealCalories(meals: z.infer<typeof MealItemSchema>[]): z.infer<typeof MealItemSchema>[] {
+        return meals.map((m) => {
+            const macroCalories = Math.round(m.protein * 4 + m.carbs * 4 + m.fat * 9);
+            const reportedCalories = m.calories;
+            // If the reported calories deviate > 20% from macro-derived, use macros
+            const macroDeviation = reportedCalories > 0
+                ? Math.abs(reportedCalories - macroCalories) / macroCalories
+                : 1;
+            return macroDeviation > 0.2
+                ? { ...m, calories: macroCalories }
+                : m;
+        });
+    }
+
+    // Resolve meal names against the candidate lookup and assemble a DayPlan
+    private _toDayPlan(
+        day: number,
+        meals: z.infer<typeof MealItemSchema>[],
+        dayTotals: NutritionTotals,
+        foodLookup: CandidatePool["foodLookup"],
+    ): DayPlan {
+        return {
+            day_number: day,
+            substitutions: [],
+            meals: meals.map((m) => {
+                // Try exact name first; strip portion hint `[...]` as fallback
+                const match = foodLookup.get(m.food_name.toLowerCase())
+                    ?? foodLookup.get(m.food_name.replace(/\s*\[.*?\]$/, "").trim().toLowerCase());
+                return {
+                    ...m,
+                    // Normalize stored name: strip portion hint so recentFoodNames stays clean
+                    food_name: m.food_name.replace(/\s*\[.*?\]$/, "").trim(),
+                    food_id: match?.source_id,
+                    source_type: match?.source_type,
+                    fdc_id: match?.fdc_id,
+                };
+            }),
+            day_totals: dayTotals,
+        };
+    }
+
+    // Generate a batch of consecutive days in ONE LLM call. Returns one entry
+    // per requested day; null = that day failed validation and needs the
+    // single-day repair path (_generateDay).
+    private async _generateBatch(
+        dayNumbers: number[],
+        targets: NutritionTotals,
+        req: GenerateMealPlanRequest,
+        pool: CandidatePool,
+        recentFoodNames: string[],
+        attemptNumber: number,
+        userBio: string | undefined,
+        proteinHints: string[],
+        allergyTerms: string[],
+    ): Promise<(DayPlan | null)[]> {
+        const mealConfig = MEAL_CONFIGS[req.meals_per_day ?? 4];
+        const cookingStyleLabel = req.cooking_style === "batch"
+            ? "Nấu 1 lần ăn cả ngày (chỉ trong ngày hôm đó, không phải cả tuần)"
+            : "Nấu tươi từng bữa";
+        const dietaryLine = req.preferences?.dietary_preference
+            ? `\n- Chế độ ăn: ${req.preferences.dietary_preference}` : "";
+        const allergyLine = req.preferences?.allergies?.length
+            ? `\n- Dị ứng/kiêng bắt buộc: ${req.preferences.allergies.join(", ")}` : "";
+        const notesLine = req.preferences?.notes
+            ? `\n- Ghi chú: ${req.preferences.notes}` : "";
+        const avoidLine = recentFoodNames.length
+            ? `\n- KHÔNG ĐƯỢC chọn lại các món đã dùng gần đây: ${recentFoodNames.join(", ")}` : "";
+
+        const candidatesBlock = this._candidateBlockFor(pool, recentFoodNames);
+        const hintLines = dayNumbers.map((d, i) => `Ngày ${d}: ${proteinHints[i]}`).join(" · ");
+        const bioline = userBio ? `\nNgười dùng: ${userBio}` : "";
+        const first = dayNumbers[0];
+        const last = dayNumbers[dayNumbers.length - 1];
+
+        const prompt = `== Kế hoạch bữa ăn: Ngày ${first}–${last}/${req.duration_days} (${dayNumbers.length} ngày trong 1 phản hồi) ==${bioline}
+Mục tiêu: ${GOAL_LABELS[req.goal]} · ${cookingStyleLabel}${dietaryLine}${allergyLine}${notesLine}
+
+Chỉ tiêu MỖI NGÀY: ${targets.calories}kcal | P:${targets.protein}g | C:${targets.carbs}g | F:${targets.fat}g
+Bữa ăn mỗi ngày: ${mealConfig.types.join(", ")}
+Gợi ý nguồn đạm theo ngày: ${hintLines}
+
+Danh sách thực phẩm (CHỈ CHỌN TRONG DANH SÁCH NÀY):
+${candidatesBlock}
+
+${this._buildRulesBlock(avoidLine, dayNumbers)}
+
+Ví dụ JSON hợp lệ (mảng "days" phải có đủ ${dayNumbers.length} ngày):
+{"days":[
+  {"day_number":${first},"meals":${EXAMPLE_MEALS_JSON}}
+]}
+
+Trả về JSON hợp lệ (không markdown, không giải thích):`;
+
+        // Same retry temperature policy as the single-day path
+        const temperature = attemptNumber === 1 ? 0.2 : 0.4;
+        const maxTokens = Math.min(MAX_TOKENS_PER_DAY * dayNumbers.length, MAX_TOKENS_PER_CALL);
+        const messages: LLMMessage[] = [
+            { role: "system", content: `${SYSTEM_ROLE}\n\n${BUSINESS_RULES}` },
+            { role: "user", content: prompt },
+        ];
+        const response = await this.llm.generate(messages, { temperature, maxTokens });
+        const parsed = await this._parseWithCorrection(
+            BatchOutputSchema, messages, response.content, `Batch days ${first}-${last}`, maxTokens,
+        );
+
+        // Map returned days to requested day numbers (by day_number when valid, else by order)
+        const byDay = new Map<number, z.infer<typeof BatchDaySchema>>();
+        parsed.days.forEach((d, i) => {
+            const dn = d.day_number != null && dayNumbers.includes(d.day_number) ? d.day_number : dayNumbers[i];
+            if (dn != null && !byDay.has(dn)) byDay.set(dn, d);
+        });
+
+        return dayNumbers.map((day) => {
+            const batchDay = byDay.get(day);
+            if (!batchDay) {
+                console.warn(`[MealPlanGenerator] Batch response missing day ${day} — will repair with single-day call`);
+                return null;
+            }
+
+            const correctedMeals = this._correctMealCalories(batchDay.meals);
+
+            const unsafeMeal = correctedMeals.find((m) => this._containsBlockedAllergen(m.food_name, allergyTerms));
+            if (unsafeMeal) {
+                console.warn(`[MealPlanGenerator] Day ${day}: meal "${unsafeMeal.food_name}" violates allergy constraints — will repair with single-day call`);
+                return null;
+            }
+
+            const dayTotals = correctedMeals.reduce(
+                (acc, m) => ({
+                    calories: acc.calories + m.calories,
+                    protein: acc.protein + m.protein,
+                    carbs: acc.carbs + m.carbs,
+                    fat: acc.fat + m.fat,
+                }),
+                { calories: 0, protein: 0, carbs: 0, fat: 0 },
+            );
+
+            const calDev = Math.abs(dayTotals.calories - targets.calories) / targets.calories;
+            if (calDev > CAL_TOLERANCE) {
+                console.warn(
+                    `[MealPlanGenerator] Day ${day} calorie deviation ${(calDev * 100).toFixed(0)}% exceeds ` +
+                    `${CAL_TOLERANCE * 100}% threshold (target ${targets.calories}, got ${dayTotals.calories}) — will repair with single-day call`,
+                );
+                return null;
+            }
+
+            return this._toDayPlan(day, correctedMeals, dayTotals, pool.foodLookup);
+        });
     }
 
     // TODO(post-deploy): _createSystemRecipe is BLOCKED.
@@ -777,29 +1252,10 @@ Bữa ăn: ${mealConfig.types.join(", ")}
 Danh sách thực phẩm (CHỈ CHỌN TRONG DANH SÁCH NÀY):
 ${candidatesBlock}
 
-QUY TẮC BẮT BUỘC:
-1. food_name copy CHÍNH XÁC từ danh sách (kể cả [...] nếu có)
-2. Calories/protein/carbs/fat = TỔNG cho khẩu phần (không phải per 100g)
-3. SỐ MÓN THEO TỪNG BỮA (văn hóa VN thực tế):
-   · breakfast: 1 món đơn lẻ (phở/bún/bánh mì/cháo/xôi/cơm tấm — CHỈ 1 dòng)
-   · morning_snack / afternoon_snack / snack: 1 món nhẹ (trái cây/sữa chua/hạt/sữa)
-   · lunch: 1–2 món (1 đơn lẻ HOẶC cơm + 1 protein)
-   · dinner: 2–3 món (cơm + protein + canh/rau — lặp meal_type để thêm)
-4. cooking_steps: 2–4 bước nấu ngắn gọn thực tế bằng tiếng Việt
-5. Tổng calories mỗi bữa ±20% mục tiêu
-6. Đa dạng nguồn protein, không lặp cùng loại đạm trong ngày
-7. TUYỆT ĐỐI không chọn món chứa dị ứng/kiêng bắt buộc của người dùng${avoidLine}
+${this._buildRulesBlock(avoidLine)}
 
 Ví dụ JSON hợp lệ:
-{"meals":[
-  {"meal_type":"breakfast","food_name":"Phở bò","weight_grams":400,"calories":450,"protein":25,"carbs":60,"fat":12,"cooking_steps":["Đun nước dùng xương bò sôi","Chan nước nóng vào tô bún, bày thịt bò tái","Thêm hành lá, rau thơm, chanh, ớt"]},
-  {"meal_type":"snack","food_name":"Chuối","weight_grams":120,"calories":107,"protein":1,"carbs":27,"fat":0,"cooking_steps":["Bóc vỏ, ăn trực tiếp"]},
-  {"meal_type":"lunch","food_name":"Cơm trắng","weight_grams":200,"calories":260,"protein":5,"carbs":58,"fat":1,"cooking_steps":["Vo gạo sạch, nấu cơm tỉ lệ 1:1.5"]},
-  {"meal_type":"lunch","food_name":"Gà kho gừng","weight_grams":120,"calories":185,"protein":22,"carbs":3,"fat":9,"cooking_steps":["Ướp gà với gừng, nước mắm, đường 15 phút","Kho lửa vừa 20 phút đến khi nước sệt"]},
-  {"meal_type":"dinner","food_name":"Cơm trắng","weight_grams":180,"calories":234,"protein":4,"carbs":52,"fat":1,"cooking_steps":["Nấu cơm"]},
-  {"meal_type":"dinner","food_name":"Cá hồi áp chảo","weight_grams":150,"calories":250,"protein":30,"carbs":0,"fat":14,"cooking_steps":["Ướp cá với muối, tiêu, chanh 10 phút","Áp chảo mỗi mặt 3–4 phút lửa vừa"]},
-  {"meal_type":"dinner","food_name":"Canh rau ngót","weight_grams":200,"calories":45,"protein":3,"carbs":7,"fat":1,"cooking_steps":["Lặt rau, rửa sạch","Nấu sôi nước, cho rau vào 5 phút, nêm muối"]}
-]}
+{"meals":${EXAMPLE_MEALS_JSON}}
 
 Trả về JSON hợp lệ (không markdown, không giải thích):`;
 
@@ -809,44 +1265,13 @@ Trả về JSON hợp lệ (không markdown, không giải thích):`;
             { role: "system", content: `${SYSTEM_ROLE}\n\n${BUSINESS_RULES}` },
             { role: "user", content: prompt },
         ];
-        const response = await this.llm.generate(messages, { temperature, maxTokens: 3500 });
+        const response = await this.llm.generate(messages, { temperature, maxTokens: MAX_TOKENS_PER_DAY });
 
-        const cleanJson = (raw: string) => raw.trim().replace(/^```json\s*/i, "").replace(/```\s*$/i, "").trim();
-        const text = cleanJson(response.content);
-        let parsed: z.infer<typeof DayOutputSchema>;
-        try {
-            parsed = DayOutputSchema.parse(JSON.parse(text));
-        } catch {
-            // Give the LLM one correction chance before throwing to the outer retry loop
-            console.warn(`[MealPlanGenerator] Day ${day} JSON parse failed — sending correction. Raw (200): ${text.slice(0, 200)}`);
-            const correctionMessages: LLMMessage[] = [
-                ...messages,
-                { role: "assistant", content: response.content },
-                { role: "user", content: "Phản hồi trên không phải JSON hợp lệ. Trả về JSON thuần túy duy nhất, bắt đầu bằng { và kết thúc bằng }, không có markdown, không có giải thích." },
-            ];
-            const correctionResp = await this.llm.generate(correctionMessages, { temperature: 0.1, maxTokens: 3500 });
-            const correctedText = cleanJson(correctionResp.content);
-            try {
-                parsed = DayOutputSchema.parse(JSON.parse(correctedText));
-            } catch (parseErr) {
-                console.error(`[MealPlanGenerator] Day ${day} JSON still invalid after correction. Raw (500): ${correctedText.slice(0, 500)}`);
-                throw parseErr;
-            }
-        }
+        const parsed = await this._parseWithCorrection(
+            DayOutputSchema, messages, response.content, `Day ${day}`, MAX_TOKENS_PER_DAY,
+        );
 
-        // Recalculate calories from macros (ground truth) and correct LLM's reported values.
-        // LLM often reports calories independently of macros; macros are more reliable.
-        const correctedMeals = parsed.meals.map((m) => {
-            const macroCalories = Math.round(m.protein * 4 + m.carbs * 4 + m.fat * 9);
-            const reportedCalories = m.calories;
-            // If the reported calories deviate > 20% from macro-derived, use macros
-            const macroDeviation = reportedCalories > 0
-                ? Math.abs(reportedCalories - macroCalories) / macroCalories
-                : 1;
-            return macroDeviation > 0.2
-                ? { ...m, calories: macroCalories }
-                : m;
-        });
+        const correctedMeals = this._correctMealCalories(parsed.meals);
 
         const unsafeMeal = correctedMeals.find((m) => this._containsBlockedAllergen(m.food_name, allergyTerms));
         if (unsafeMeal) {
@@ -877,26 +1302,7 @@ Trả về JSON hợp lệ (không markdown, không giải thích):`;
             );
         }
         // Use macro-corrected meals instead of raw LLM output
-        parsed = { meals: correctedMeals };
-
-        const plan: DayPlan = {
-            day_number: day,
-            substitutions: [],
-            meals: parsed.meals.map((m) => {
-                // Try exact name first; strip portion hint `[...]` as fallback
-                const match = foodLookup.get(m.food_name.toLowerCase())
-                    ?? foodLookup.get(m.food_name.replace(/\s*\[.*?\]$/, "").trim().toLowerCase());
-                return {
-                    ...m,
-                    // Normalize stored name: strip portion hint so recentFoodNames stays clean
-                    food_name: m.food_name.replace(/\s*\[.*?\]$/, "").trim(),
-                    food_id: match?.source_id,
-                    source_type: match?.source_type,
-                    fdc_id: match?.fdc_id,
-                };
-            }),
-            day_totals: dayTotals,
-        };
+        const plan = this._toDayPlan(day, correctedMeals, dayTotals, foodLookup);
 
         return { plan, mealTypeCandidates };
     }

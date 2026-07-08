@@ -29,6 +29,9 @@ export interface LLMResponse {
 }
 
 const GROQ_MODEL = "llama-3.3-70b-versatile";
+const GROQ_VISION_MODEL = process.env.GROQ_VISION_MODEL || "meta-llama/llama-4-scout-17b-16e-instruct";
+// Flat token estimate for one image input on Llama-4 vision models.
+const VISION_IMAGE_TOKEN_ESTIMATE = 1500;
 
 // Vietnamese diacritics and CJK characters tokenize at roughly 1 token per 1.5 chars,
 // compared to ~1 token per 4 chars for pure ASCII. Using a mixed estimate prevents
@@ -126,6 +129,43 @@ export class GroqService {
             content: choice.message.content ?? "",
             tool_calls: toolCalls,
         };
+    }
+
+    /**
+     * Vision call against a Groq-hosted multimodal Llama model. Used as the
+     * cross-provider fallback when Gemini vision 503s at peak hours.
+     * Returns the raw text response; JSON parsing happens in VisionService.
+     */
+    async visionRaw(
+        prompt: string,
+        imageBase64: string,
+        mimeType: string,
+        opts: LLMOptions = {},
+    ): Promise<string> {
+        await this.reqBucket.consume(1);
+        await this.tokenBucket.consume(
+            _estimateTokens([{ role: "user", content: prompt }]) + VISION_IMAGE_TOKEN_ESTIMATE,
+        );
+
+        const completion = await this.client.chat.completions.create({
+            model: GROQ_VISION_MODEL,
+            messages: [
+                {
+                    role: "user",
+                    content: [
+                        { type: "text", text: prompt },
+                        {
+                            type: "image_url",
+                            image_url: { url: `data:${mimeType};base64,${imageBase64}` },
+                        },
+                    ],
+                },
+            ],
+            temperature: opts.temperature ?? 0.2,
+            max_tokens: opts.maxTokens ?? 1024,
+        });
+
+        return completion.choices[0]?.message?.content ?? "";
     }
 
     async *stream(

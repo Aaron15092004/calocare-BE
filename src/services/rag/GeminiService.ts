@@ -2,6 +2,43 @@ import { GoogleGenerativeAI, GenerativeModel } from "@google/generative-ai";
 import { LLMMessage, LLMOptions, LLMResponse } from "./GroqService";
 
 const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-flash-latest";
+const GEMINI_FALLBACK_MODEL = process.env.GEMINI_FALLBACK_MODEL || "gemini-flash-lite-latest";
+// Paid tier default; lower via env if quota issues reappear.
+const GEMINI_RPM = Number(process.env.GEMINI_RPM) || 60;
+
+const RETRY_DELAYS_MS = [1000, 3000];
+
+export function isTransientGeminiError(err: unknown): boolean {
+    const msg = err instanceof Error ? err.message : String(err ?? "");
+    return /(^|\D)(429|503)(\D|$)|rate.?limit|overloaded|quota|resource.?exhausted|service unavailable|fetch failed|network|ECONNRESET|ETIMEDOUT/i.test(msg);
+}
+
+/** Simple request-per-minute bucket, mirroring GroqService's TokenBucket. */
+class RequestBucket {
+    private tokens: number;
+    private lastRefill: number;
+
+    constructor(private readonly capacity: number, private readonly refillPerMs: number) {
+        this.tokens = capacity;
+        this.lastRefill = Date.now();
+    }
+
+    async consume(): Promise<void> {
+        this._refill();
+        if (this.tokens < 1) {
+            const waitMs = Math.ceil((1 - this.tokens) / this.refillPerMs);
+            await new Promise((r) => setTimeout(r, waitMs));
+            this._refill();
+        }
+        this.tokens -= 1;
+    }
+
+    private _refill(): void {
+        const now = Date.now();
+        this.tokens = Math.min(this.capacity, this.tokens + (now - this.lastRefill) * this.refillPerMs);
+        this.lastRefill = now;
+    }
+}
 
 export interface VisionResult {
   main_dish_vi: string;
@@ -29,12 +66,44 @@ export interface MultiVisionResult {
 
 export class GeminiService {
   private readonly model: GenerativeModel;
+  private readonly fallbackModel: GenerativeModel | null;
+  private readonly bucket = new RequestBucket(GEMINI_RPM, GEMINI_RPM / 60_000);
 
   constructor() {
     const key = process.env.GEMINI_API_KEY;
     if (!key) throw new Error("GEMINI_API_KEY is not set");
     const genai = new GoogleGenerativeAI(key);
     this.model = genai.getGenerativeModel({ model: GEMINI_MODEL });
+    this.fallbackModel = GEMINI_FALLBACK_MODEL && GEMINI_FALLBACK_MODEL !== GEMINI_MODEL
+      ? genai.getGenerativeModel({ model: GEMINI_FALLBACK_MODEL })
+      : null;
+  }
+
+  /**
+   * Run a Gemini call with the request bucket, transient-error retries
+   * (1s → 3s backoff), then one attempt on the fallback model. Peak-hour
+   * 503s were reaching users directly because none of this existed.
+   */
+  private async _resilient<T>(run: (model: GenerativeModel) => Promise<T>): Promise<T> {
+    await this.bucket.consume();
+
+    let lastErr: unknown;
+    for (let attempt = 0; attempt <= RETRY_DELAYS_MS.length; attempt++) {
+      try {
+        return await run(this.model);
+      } catch (err) {
+        lastErr = err;
+        if (!isTransientGeminiError(err) || attempt === RETRY_DELAYS_MS.length) break;
+        console.warn(`[Gemini] transient error (attempt ${attempt + 1}), retrying:`, err instanceof Error ? err.message : err);
+        await new Promise((r) => setTimeout(r, RETRY_DELAYS_MS[attempt]));
+      }
+    }
+
+    if (this.fallbackModel && isTransientGeminiError(lastErr)) {
+      console.warn(`[Gemini] primary model exhausted, trying fallback ${GEMINI_FALLBACK_MODEL}`);
+      return run(this.fallbackModel);
+    }
+    throw lastErr;
   }
 
   async generate(
@@ -52,19 +121,21 @@ export class GeminiService {
 
     const lastMsg = userMessages[userMessages.length - 1]?.content ?? "";
 
-    const chat = this.model.startChat({
-      history: chatHistory,
-      systemInstruction: systemMsg
-        ? { role: "user", parts: [{ text: systemMsg.content }] }
-        : undefined,
-      generationConfig: {
-        temperature: opts.temperature ?? 0.7,
-        maxOutputTokens: opts.maxTokens ?? 1024,
-      },
-    });
+    return this._resilient(async (model) => {
+      const chat = model.startChat({
+        history: chatHistory,
+        systemInstruction: systemMsg
+          ? { role: "user", parts: [{ text: systemMsg.content }] }
+          : undefined,
+        generationConfig: {
+          temperature: opts.temperature ?? 0.7,
+          maxOutputTokens: opts.maxTokens ?? 1024,
+        },
+      });
 
-    const result = await chat.sendMessage(lastMsg);
-    return { content: result.response.text() };
+      const result = await chat.sendMessage(lastMsg);
+      return { content: result.response.text() };
+    });
   }
 
   async *stream(
@@ -75,105 +146,36 @@ export class GeminiService {
     const userMessages = messages.filter((m) => m.role !== "system");
     const lastMsg = userMessages[userMessages.length - 1]?.content ?? "";
 
-    const chat = this.model.startChat({
-      systemInstruction: systemMsg
-        ? { role: "user", parts: [{ text: systemMsg.content }] }
-        : undefined,
-      generationConfig: {
-        temperature: opts.temperature ?? 0.7,
-        maxOutputTokens: opts.maxTokens ?? 2048,
-      },
+    // Streams cannot retry mid-flight; the bucket + fallback still protect
+    // the initial connection, which is where peak-hour 503s occur.
+    const result = await this._resilient((model) => {
+      const chat = model.startChat({
+        systemInstruction: systemMsg
+          ? { role: "user", parts: [{ text: systemMsg.content }] }
+          : undefined,
+        generationConfig: {
+          temperature: opts.temperature ?? 0.7,
+          maxOutputTokens: opts.maxTokens ?? 2048,
+        },
+      });
+      return chat.sendMessageStream(lastMsg);
     });
-
-    const result = await chat.sendMessageStream(lastMsg);
     for await (const chunk of result.stream) {
       const text = chunk.text();
       if (text) yield text;
     }
   }
 
-  async vision(imageBase64: string, mimeType: string): Promise<VisionResult> {
-    const prompt = `Analyze this food image and respond ONLY with valid JSON (no markdown, no explanation).
-
-Required format:
-{
-  "main_dish_vi": "Vietnamese name of the main dish",
-  "main_dish_en": "English name of the main dish",
-  "components": ["ingredient1", "ingredient2"],
-  "estimated_portion_grams": 300,
-  "cuisine": "Vietnamese",
-  "cooking_method": "boiled",
-  "confidence": 0.85,
-  "not_food": false
-}
-
-If the image does not contain food, set not_food: true and use empty strings for other fields.`;
-
-    const result = await this.model.generateContent([
+  /**
+   * Raw vision call — prompt construction and JSON parsing live in
+   * VisionService so the Groq fallback provider shares them exactly.
+   */
+  async visionRaw(prompt: string, imageBase64: string, mimeType: string): Promise<string> {
+    const result = await this._resilient((model) => model.generateContent([
       prompt,
       { inlineData: { mimeType, data: imageBase64 } },
-    ]);
-
-    const text = result.response.text().trim();
-    // Strip markdown code fences if present
-    const cleaned = text
-      .replace(/^```json\s*/i, "")
-      .replace(/```\s*$/i, "")
-      .trim();
-
-    try {
-      return JSON.parse(cleaned) as VisionResult;
-    } catch {
-      throw new Error(
-        `Gemini vision returned invalid JSON: ${cleaned.slice(0, 200)}`,
-      );
-    }
-  }
-
-  async visionMulti(
-    imageBase64: string,
-    mimeType: string,
-  ): Promise<MultiVisionResult> {
-    const prompt = `Analyze this food image that may contain MULTIPLE dishes or food items. Identify ALL distinct Vietnamese-relevant dishes/foods visible.
-Respond ONLY with valid JSON (no markdown, no explanation).
-
-Required format:
-{
-  "items": [
-    { "name_vi": "Tên món (tiếng Việt)", "name_en": "Dish name (English)", "estimated_portion_grams": 200, "confidence": 0.9, "components": ["cơm", "sườn", "dưa leo"] },
-    { "name_vi": "Tên món 2", "name_en": "Dish 2", "estimated_portion_grams": 150, "confidence": 0.85, "components": ["thành phần nhìn thấy"] }
-  ],
-  "not_food": false
-}
-
-Rules:
-- List every distinct food item you can identify separately.
-- Prefer common Vietnamese dish names when the image looks like Vietnamese food.
-- Do not split a composed dish into ingredients unless the image clearly shows separate foods on the plate.
-- If only one food item is visible, return an array with one element.
-- If the image does not contain food, set not_food: true and items: [].
-- Components are visible ingredients only; keep them short.
-- Confidence 0–1 (how certain you are about the identification).`;
-
-    const result = await this.model.generateContent([
-      prompt,
-      { inlineData: { mimeType, data: imageBase64 } },
-    ]);
-
-    const text = result.response.text().trim();
-    const cleaned = text
-      .replace(/^```json\s*/i, "")
-      .replace(/```\s*$/i, "")
-      .trim();
-
-    try {
-      const parsed = JSON.parse(cleaned) as MultiVisionResult;
-      return { items: parsed.items ?? [], not_food: parsed.not_food };
-    } catch {
-      throw new Error(
-        `Gemini visionMulti returned invalid JSON: ${cleaned.slice(0, 200)}`,
-      );
-    }
+    ]));
+    return result.response.text().trim();
   }
 }
 

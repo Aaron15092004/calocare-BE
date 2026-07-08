@@ -7,6 +7,7 @@ import { getScannerService } from "../services/rag/ScannerService";
 import { getFatSecretService } from "../services/rag/FatSecretService";
 import { IUser } from "../models/User";
 import { logRag } from "../utils/logger";
+import { toUserError } from "../utils/userFacingError";
 import Food from "../models/Food";
 
 const router = Router();
@@ -141,6 +142,38 @@ router.post(
                 status: "ok",
             });
 
+            // When the primary match is only a low-confidence AI estimate,
+            // expose hydrated mid-score candidates so the user can pick the
+            // right dish instead of accepting the estimate blindly.
+            const alternatives = result.fallback_used
+                ? result.alternatives
+                    .filter((alt) => alt.energy_kcal !== undefined)
+                    .slice(0, 3)
+                    .map((alt) => {
+                        const altGrams = alt.estimated_portion_grams ?? servingGrams;
+                        const altF = altGrams / 100;
+                        const altPer100g = {
+                            calories: alt.energy_kcal ?? 0,
+                            protein: alt.protein ?? 0,
+                            carbs: alt.glucid ?? 0,
+                            fat: alt.lipid ?? 0,
+                        };
+                        return {
+                            name: alt.name,
+                            calories: Math.round(altPer100g.calories * altF),
+                            protein: Math.round(altPer100g.protein * altF * 10) / 10,
+                            carbs: Math.round(altPer100g.carbs * altF * 10) / 10,
+                            fat: Math.round(altPer100g.fat * altF * 10) / 10,
+                            serving_size: altGrams,
+                            serving_unit: "g",
+                            confidence: alt.confidence,
+                            per_100g: altPer100g,
+                            source_type: alt.source_type,
+                            source_id: alt.source_id ?? null,
+                        };
+                    })
+                : [];
+
             res.json({
                 name:
                     match?.name ||
@@ -159,17 +192,19 @@ router.post(
                 per_100g: per100g,
                 source_type: match?.source_type ?? null,
                 source_id: match?.source_id ?? null,
+                ...(alternatives.length > 0 ? { alternatives } : {}),
             });
         } catch (err) {
-            const msg = err instanceof Error ? err.message : "Scan failed";
+            const raw = err instanceof Error ? err.message : "Scan failed";
             logRag({
                 endpoint: "scan",
                 userId: user?._id?.toString(),
                 latency_ms: Date.now() - t0,
                 status: "error",
-                error: msg,
+                error: raw,
             });
-            res.status(500).json({ error: msg });
+            const friendly = toUserError(err);
+            res.status(friendly.status).json({ error: friendly.message, code: friendly.code });
         }
     },
 );

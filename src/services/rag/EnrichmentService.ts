@@ -611,7 +611,69 @@ export class EnrichmentService {
      * RAG-03: Queue Recipe/Food records that are missing an image_url for enrichment.
      * Runs in small batches to stay within rate limits. Returns count queued.
      */
-    async runImageBackfill(batchSize = 50): Promise<{ recipes: number; foods: number }> {
+    /**
+     * Directly fetch images for raw Food docs (FS-/VN-institute sourced) that
+     * the queue-based paths never covered — 99% of foods had no image.
+     * Same chain as recipes: Open Food Facts → Unsplash → Cloudinary mirror.
+     * English names match stock-photo indexes better, so prefer name_en.
+     */
+    async backfillFoodImages(limit = 40): Promise<number> {
+        const foodsWithoutImage = await Food.find({
+            $or: [{ image_url: { $in: [null, ""] } }, { image_url: { $exists: false } }],
+        })
+            .select("_id name_vi name_en")
+            .limit(limit)
+            .lean();
+
+        let updated = 0;
+        for (const food of foodsWithoutImage) {
+            const nameForSearch = (food.name_en as string | undefined)?.trim() || food.name_vi;
+            let rawImageUrl: string | null = null;
+            let imageAttribution: unknown;
+
+            try {
+                const offUrl = await offSearchImage(nameForSearch);
+                if (offUrl) {
+                    rawImageUrl = offUrl;
+                    imageAttribution = { source: "openfoodfacts" };
+                }
+            } catch (err) {
+                console.warn("[EnrichmentService] OFF food image lookup failed:", err instanceof Error ? err.message : String(err));
+            }
+
+            if (!rawImageUrl) {
+                try {
+                    const result = await getImageService().fetchFoodImage(nameForSearch);
+                    if (result) {
+                        rawImageUrl = result.url;
+                        imageAttribution = result.attribution;
+                    }
+                } catch (err) {
+                    if (err instanceof UnsplashRateLimitError) {
+                        console.warn("[EnrichmentService] Unsplash rate limited, stopping food image backfill early");
+                        break;
+                    }
+                    console.warn("[EnrichmentService] Unsplash food image lookup failed:", err instanceof Error ? err.message : String(err));
+                }
+            }
+
+            if (!rawImageUrl) continue;
+
+            try {
+                const finalUrl = await mirrorToCloudinary(rawImageUrl, `food-doc-${food._id.toString()}`);
+                await Food.updateOne(
+                    { _id: food._id },
+                    { $set: { image_url: finalUrl, image_attribution: imageAttribution } },
+                );
+                updated++;
+            } catch (err) {
+                console.warn("[EnrichmentService] Cloudinary mirror failed for food:", err instanceof Error ? err.message : String(err));
+            }
+        }
+        return updated;
+    }
+
+    async runImageBackfill(batchSize = 50): Promise<{ recipes: number; foods: number; food_docs: number }> {
         // Recipes without images
         const recipesWithoutImage = await Recipe.find({
             $or: [{ image_url: { $in: [null, ""] } }, { image_url: { $exists: false } }],
@@ -649,8 +711,11 @@ export class EnrichmentService {
             foodsQueued++;
         }
 
-        console.log(`[EnrichmentService] Image backfill queued: ${recipesQueued} recipes, ${foodsQueued} USDA foods`);
-        return { recipes: recipesQueued, foods: foodsQueued };
+        // Raw Food docs (FS-/VN sourced) — direct fetch, not queue-based
+        const foodDocsUpdated = await this.backfillFoodImages(Math.min(batchSize, 40));
+
+        console.log(`[EnrichmentService] Image backfill queued: ${recipesQueued} recipes, ${foodsQueued} USDA foods, ${foodDocsUpdated} food docs updated`);
+        return { recipes: recipesQueued, foods: foodsQueued, food_docs: foodDocsUpdated };
     }
 
     /**
