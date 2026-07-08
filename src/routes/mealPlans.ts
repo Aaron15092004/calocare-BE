@@ -79,6 +79,8 @@ router.get("/", authenticate, async (req: Request, res: Response) => {
         }
 
         if (goal_type) filter.goal_type = goal_type;
+        // Hide in-flight/failed generations (legacy docs have no status field and pass)
+        filter.status = { $nin: ["generating", "failed"] };
 
         const plans = await MealPlan.find(filter)
             .sort({ created_at: -1 })
@@ -92,12 +94,70 @@ router.get("/", authenticate, async (req: Request, res: Response) => {
     }
 });
 
+// GET /api/meal-plans/mine/recovery — most recent AI-generated plan (last 24h)
+// not yet linked to a UserMealPlan, so a client that disconnected mid-generation
+// can find it again. Registered before /:id so the path isn't shadowed.
+router.get("/mine/recovery", authenticate, async (req: Request, res: Response) => {
+    try {
+        const user = req.user as IUser;
+        const since = new Date(Date.now() - 24 * 3600 * 1000);
+        // Only plans with an explicit status (new generator) — legacy drafts stay out
+        const plan = await MealPlan.findOne({
+            creator_id: user._id,
+            created_at: { $gte: since },
+            status: { $in: ["generating", "partial", "completed"] },
+        })
+            .sort({ created_at: -1 })
+            .lean();
+
+        if (!plan) {
+            res.json({ plan: null });
+            return;
+        }
+        const linked = await UserMealPlan.findOne({ user_id: user._id, meal_plan_id: plan._id }).lean();
+        if (linked) {
+            res.json({ plan: null });
+            return;
+        }
+        res.json({
+            plan: {
+                _id: plan._id,
+                title: plan.title,
+                status: plan.status,
+                generated_days: plan.generated_days ?? 0,
+                total_days: plan.total_days,
+                goal_type: plan.goal_type,
+                generation_error: plan.generation_error,
+                created_at: plan.created_at,
+            },
+        });
+    } catch (error) {
+        res.status(500).json({ error: (error as Error).message });
+    }
+});
+
+// Visibility: private plans are readable only by their creator, someone who has
+// the plan linked (cloned/activated before it was unpublished), or staff.
+async function canViewPlan(user: IUser, plan: { _id: unknown; creator_id?: { toString(): string } | null; is_public: boolean; is_approved: boolean }): Promise<boolean> {
+    const isAdmin = (user as any).role === "admin" || (user as any).role === "moderator";
+    if (isAdmin) return true;
+    if (plan.creator_id?.toString() === (user._id as { toString(): string }).toString()) return true;
+    if (plan.is_public && plan.is_approved) return true;
+    const linked = await UserMealPlan.findOne({ user_id: user._id, meal_plan_id: plan._id }).lean();
+    return linked !== null;
+}
+
 // GET /api/meal-plans/:id
 router.get("/:id", authenticate, async (req: Request, res: Response) => {
     try {
+        const user = req.user as IUser;
         const plan = await MealPlan.findById(req.params.id);
         if (!plan) {
             res.status(404).json({ error: "Meal plan not found" });
+            return;
+        }
+        if (!(await canViewPlan(user, plan))) {
+            res.status(403).json({ error: "Forbidden" });
             return;
         }
         const items = await MealPlanItem.find({ meal_plan_id: plan._id })
@@ -375,6 +435,16 @@ router.get("/templates", authenticate, async (_req: Request, res: Response) => {
 // GET /api/meal-plans/:id/shopping-list — generate ingredients list from meal plan items (MP-09)
 router.get("/:id/shopping-list", authenticate, async (req: Request, res: Response) => {
     try {
+        const user = req.user as IUser;
+        const plan = await MealPlan.findById(req.params.id);
+        if (!plan) {
+            res.status(404).json({ error: "Meal plan not found" });
+            return;
+        }
+        if (!(await canViewPlan(user, plan))) {
+            res.status(403).json({ error: "Forbidden" });
+            return;
+        }
         const items = await MealPlanItem.find({ meal_plan_id: req.params.id })
             .populate("food_id", "name_vi")
             .populate("recipe_id", "name_vi ingredients")

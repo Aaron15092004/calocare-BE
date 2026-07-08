@@ -126,6 +126,14 @@ async function consumeMealPlanUnlock(unlockKey: string): Promise<boolean> {
     return result !== null;
 }
 
+// Give back a consumed unlock when the generation it paid for produced nothing.
+async function restoreMealPlanUnlock(unlockKey: string): Promise<void> {
+    const db = mongoose.connection.db;
+    if (!db) return;
+    await ensureIndexes();
+    await db.collection(COL).updateOne({ key: unlockKey }, { $set: { count: 1 } });
+}
+
 // Exported helpers used by rewards route
 export { atomicIncrement, getCount, secondsUntilMidnightUTC };
 
@@ -153,7 +161,20 @@ export function ragRateLimit(endpoint: Endpoint) {
                 });
                 return;
             }
-            // Unlock consumed — allow this one generation
+            // Unlock consumed — allow this one generation. Expose an idempotent
+            // refund for total failures: SSE routes respond 200 before working,
+            // so the finish-hook below can't see the failure — the route calls
+            // res.locals.ragRefund() itself when nothing was produced.
+            let refunded = false;
+            const refund = async () => {
+                if (refunded) return;
+                refunded = true;
+                await restoreMealPlanUnlock(unlockKey);
+            };
+            res.locals.ragRefund = refund;
+            res.on("finish", () => {
+                if (res.statusCode >= 400) refund().catch(() => {});
+            });
             next();
             return;
         }
@@ -196,10 +217,18 @@ export function ragRateLimit(endpoint: Endpoint) {
 
         res.setHeader("X-RateLimit-Limit", effectiveLimit);
         res.setHeader("X-RateLimit-Remaining", effectiveLimit - current);
+        // Idempotent refund shared by the finish-hook (plain JSON endpoints that
+        // fail with >=400) and SSE routes (which respond 200 up-front and must
+        // call res.locals.ragRefund() themselves on total failure).
+        let refunded = false;
+        const refund = async () => {
+            if (refunded) return;
+            refunded = true;
+            await atomicDecrement(key);
+        };
+        res.locals.ragRefund = refund;
         res.on("finish", () => {
-            if (res.statusCode >= 400) {
-                atomicDecrement(key).catch(() => {});
-            }
+            if (res.statusCode >= 400) refund().catch(() => {});
         });
         next();
     };

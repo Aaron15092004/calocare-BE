@@ -3,7 +3,7 @@ import mongoose, { Schema, Document, Types } from "mongoose";
 export interface IUserMealPlanItem extends Document {
     user_meal_plan_id: Types.ObjectId;
     day_number: number;
-    meal_type: "breakfast" | "lunch" | "dinner" | "snack";
+    meal_type: "breakfast" | "lunch" | "dinner" | "snack" | "morning_snack" | "afternoon_snack";
     recipe_id?: Types.ObjectId;
     food_id?: Types.ObjectId;
     serving_size?: number;
@@ -24,7 +24,7 @@ const UserMealPlanItemSchema = new Schema<IUserMealPlanItem>(
         day_number: { type: Number, required: true },
         meal_type: {
             type: String,
-            enum: ["breakfast", "lunch", "dinner", "snack"],
+            enum: ["breakfast", "lunch", "dinner", "snack", "morning_snack", "afternoon_snack"],
             required: true,
         },
         recipe_id: { type: Schema.Types.ObjectId, ref: "Recipe" },

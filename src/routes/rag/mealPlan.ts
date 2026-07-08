@@ -40,7 +40,17 @@ router.post("/", authenticate, ragRateLimit("meal-plan"), async (req: Request, r
     res.setHeader("X-Accel-Buffering", "no");
     res.flushHeaders();
 
+    // Generation intentionally CONTINUES after the client disconnects — the plan
+    // doc (status/generated_days) is the durable record and the client recovers
+    // it via GET /api/meal-plans/mine/recovery. Only the writes are guarded.
+    let clientGone = false;
+    req.on("close", () => {
+        clientGone = true;
+        logRag({ endpoint: "meal-plan", userId, status: "ok", latency_ms: Date.now() - t0, error: "client_disconnected_generation_continues" });
+    });
+
     const sendEvent = (type: string, data: unknown) => {
+        if (clientGone || res.writableEnded) return;
         res.write(`event: ${type}\ndata: ${JSON.stringify(data)}\n\n`);
     };
 
@@ -73,10 +83,14 @@ router.post("/", authenticate, ragRateLimit("meal-plan"), async (req: Request, r
     } catch (err) {
         const raw = err instanceof Error ? err.message : "Generation failed";
         logRag({ endpoint: "meal-plan", userId, latency_ms: Date.now() - t0, status: "error", error: raw });
+        // The generator only throws when nothing usable was produced (0 days kept)
+        // — refund the consumed quota/unlock so the user can retry.
+        const refund = res.locals.ragRefund as (() => Promise<void>) | undefined;
+        if (refund) await refund().catch(() => {});
         const friendly = toUserError(err);
         sendEvent("error", { message: friendly.message, code: friendly.code });
     } finally {
-        res.end();
+        if (!res.writableEnded) res.end();
     }
 });
 

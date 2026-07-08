@@ -64,4 +64,6 @@ const MealPlanItemSchema = new Schema<IMealPlanItem>(
     },
 );
 
+MealPlanItemSchema.index({ meal_plan_id: 1, day_number: 1 });
+
 export default mongoose.model<IMealPlanItem>("MealPlanItem", MealPlanItemSchema);

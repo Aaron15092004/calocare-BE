@@ -219,6 +219,9 @@ interface CandidatePool {
 
 // Days per LLM call. 21 → 7×3; 7 → 3+3+1 (remainder chunk).
 const BATCH_SIZE = 3;
+// Wall-clock ceiling for one generation run; on expiry the plan is finalized
+// as partial with whatever days were persisted instead of hanging forever.
+const GENERATION_DEADLINE_MS = 15 * 60_000;
 // Per-day output budget; total per call capped at 8000 so the Gemini 2.0 Flash
 // fallback (8192 max output tokens) can still serve a full batch.
 const MAX_TOKENS_PER_DAY = 3500;
@@ -242,7 +245,7 @@ export class MealPlanGeneratorService {
 
     async generate(
         req: GenerateMealPlanRequest,
-        onProgress: (event: "progress" | "day" | "done" | "error", data: unknown) => void,
+        onProgress: (event: "created" | "progress" | "day" | "done" | "error", data: unknown) => void,
     ): Promise<{ planId: string; source_breakdown: { usda: number; recipe: number; food: number; ai_generated: number } }> {
         const user = await User.findById(req.userId)
             .select("daily_nutrition_goals display_name preferences")
@@ -306,7 +309,8 @@ export class MealPlanGeneratorService {
         if (effectiveAllergies?.length) bioLines.push(`tránh: ${effectiveAllergies.join(", ")}`);
         const userBio = bioLines.length ? bioLines.join(" · ") : undefined;
 
-        // Create MealPlan record
+        // Create MealPlan record up-front with status "generating" so a client
+        // that disconnects can recover it later (see /api/meal-plans/mine/recovery).
         const plan = await MealPlan.create({
             title: `Kế hoạch ${req.goal === "weight_loss" ? "giảm cân" : req.goal === "muscle_gain" ? "tăng cơ" : "duy trì"} ${req.duration_days} ngày`,
             total_days: req.duration_days,
@@ -314,17 +318,24 @@ export class MealPlanGeneratorService {
             is_public: false,
             is_approved: false,
             creator_id: new Types.ObjectId(req.userId),
+            status: "generating",
+            generated_days: 0,
         });
         trackAiUsage("meal_plan");
         trackAiUsage("meal_plan_day", req.duration_days);
+        onProgress("created", { meal_plan_id: (plan._id as Types.ObjectId).toString() });
 
         const recentFoodNames: string[] = [];
         const proteinSourceLog: string[] = [];
         let nextDayProteinHint: string | undefined;
         const days: DayPlan[] = [];
+        const completedDayNumbers: number[] = [];
         const sourceBreakdown = { usda: 0, recipe: 0, food: 0, ai_generated: 0 };
         const recipeIdsForEnrichment = new Set<string>();
+        // Wall-clock guard: a stuck provider must not hold the request forever.
+        const deadline = Date.now() + GENERATION_DEADLINE_MS;
 
+        try {
         // Fetch the candidate pool ONCE for the whole plan (vector + FatSecret),
         // then generate days in batches of BATCH_SIZE per LLM call.
         const allergyTerms = this._buildAllergyTerms(effectiveReq.preferences?.allergies);
@@ -332,6 +343,10 @@ export class MealPlanGeneratorService {
 
         const batches = this._chunkDays(req.duration_days, BATCH_SIZE);
         for (const batchDays of batches) {
+            if (Date.now() > deadline) {
+                console.warn(`[MealPlanGenerator] Deadline exceeded after ${days.length} days — finalizing as partial`, { userId: req.userId });
+                break;
+            }
             onProgress("progress", { current_day: batchDays[0], total_days: req.duration_days });
 
             const proteinHints = batchDays.map((d, i) =>
@@ -387,6 +402,12 @@ export class MealPlanGeneratorService {
                 if (!finalized.ok) continue;
 
                 days.push(finalized.dayPlan);
+                completedDayNumbers.push(day);
+                // Persist progress so a disconnected client can poll/recover the plan
+                await MealPlan.updateOne(
+                    { _id: plan._id },
+                    { $set: { generated_days: days.length } },
+                ).catch(() => {});
                 recentFoodNames.push(...finalized.dayPlan.meals.map((m) => m.food_name));
                 // Keep up to 120 recent names (21 days × 5 meals = 105 + buffer).
                 if (recentFoodNames.length > 120) recentFoodNames.splice(0, 10);
@@ -394,13 +415,26 @@ export class MealPlanGeneratorService {
             }
         }
 
-        if (days.length !== req.duration_days) {
+        // Finalize: keep whatever was generated instead of deleting hours of work.
+        // 0 days → nothing usable, clean up and fail (route refunds quota).
+        if (days.length === 0) {
             await MealPlanItem.deleteMany({ meal_plan_id: plan._id });
             await MealPlan.deleteOne({ _id: plan._id });
-            throw new Error(`Chưa tạo đủ kế hoạch ${req.duration_days} ngày (${days.length}/${req.duration_days}). Vui lòng thử lại.`);
+            throw new Error(`Không tạo được kế hoạch ${req.duration_days} ngày. Vui lòng thử lại.`);
         }
 
-        // Queue recipe enrichment for all recipes used in this plan
+        let planStatus: "completed" | "partial" = "completed";
+        if (days.length < req.duration_days) {
+            planStatus = "partial";
+            await this._finalizeAsPartial(plan._id as Types.ObjectId, completedDayNumbers, req.duration_days);
+        } else {
+            await MealPlan.updateOne(
+                { _id: plan._id },
+                { $set: { status: "completed", generated_days: days.length } },
+            );
+        }
+
+        // Queue recipe enrichment for all recipes used in this plan (partial plans too)
         if (recipeIdsForEnrichment.size > 0) {
             this.enrichment
                 .queueRecipeEnrichment([...recipeIdsForEnrichment], { type: "meal_plan" })
@@ -408,8 +442,70 @@ export class MealPlanGeneratorService {
         }
 
         const planId = (plan._id as Types.ObjectId).toString();
-        onProgress("done", { meal_plan_id: planId, days_generated: days.length, source_breakdown: sourceBreakdown });
+        onProgress("done", {
+            meal_plan_id: planId,
+            days_generated: days.length,
+            plan_status: planStatus,
+            requested_days: req.duration_days,
+            source_breakdown: sourceBreakdown,
+        });
         return { planId, source_breakdown: sourceBreakdown };
+
+        } catch (err) {
+            // Unexpected mid-run failure. Salvage persisted days as a partial plan
+            // rather than leaving an orphaned "generating" doc (or deleting work).
+            if (days.length > 0) {
+                console.error("[MealPlanGenerator] Unexpected failure — salvaging partial plan:", err instanceof Error ? err.message : String(err), { userId: req.userId, daysKept: days.length });
+                await this._finalizeAsPartial(plan._id as Types.ObjectId, completedDayNumbers, req.duration_days).catch(() => {});
+                const planId = (plan._id as Types.ObjectId).toString();
+                onProgress("done", {
+                    meal_plan_id: planId,
+                    days_generated: days.length,
+                    plan_status: "partial",
+                    requested_days: req.duration_days,
+                    source_breakdown: sourceBreakdown,
+                });
+                return { planId, source_breakdown: sourceBreakdown };
+            }
+            await MealPlanItem.deleteMany({ meal_plan_id: plan._id }).catch(() => {});
+            await MealPlan.deleteOne({ _id: plan._id }).catch(() => {});
+            throw err;
+        }
+    }
+
+    // Compact day numbering (a middle day can fail while later days succeed) so
+    // the plan reads Ngày 1..N without holes, then mark the plan as partial.
+    // Ascending order guarantees the target slot is always free.
+    private async _finalizeAsPartial(
+        planId: Types.ObjectId,
+        completedDayNumbers: number[],
+        requestedDays: number,
+    ): Promise<void> {
+        const daysKept = completedDayNumbers.length;
+        const renumberOps = completedDayNumbers
+            .map((oldDay, idx) => ({ oldDay, newDay: idx + 1 }))
+            .filter(({ oldDay, newDay }) => oldDay !== newDay)
+            .map(({ oldDay, newDay }) => ({
+                updateMany: {
+                    filter: { meal_plan_id: planId, day_number: oldDay },
+                    update: { $set: { day_number: newDay } },
+                },
+            }));
+        if (renumberOps.length > 0) {
+            await MealPlanItem.bulkWrite(renumberOps, { ordered: true });
+        }
+        await MealPlan.updateOne(
+            { _id: planId },
+            {
+                $set: {
+                    status: "partial",
+                    total_days: daysKept,
+                    generated_days: daysKept,
+                    generation_error: `Tạo được ${daysKept}/${requestedDays} ngày do gián đoạn`,
+                    description: `Kế hoạch ${daysKept} ngày (mục tiêu ban đầu ${requestedDays} ngày — một số ngày tạo không thành công).`,
+                },
+            },
+        );
     }
 
     // Split 1..duration into consecutive chunks of `size` (e.g. 7 → [1-3],[4-6],[7])
