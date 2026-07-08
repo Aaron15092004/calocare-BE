@@ -68,11 +68,27 @@ router.get("/", authenticate, async (req: Request, res: Response) => {
             const stats = await MealPlanItem.aggregate([
                 { $match: { meal_plan_id: { $in: planIds } } },
                 {
+                    $lookup: {
+                        from: "recipes",
+                        localField: "recipe_id",
+                        foreignField: "_id",
+                        as: "recipe",
+                        pipeline: [{ $project: { image_url: 1 } }],
+                    },
+                },
+                {
+                    $addFields: {
+                        any_image: {
+                            $ifNull: ["$image_url", { $arrayElemAt: ["$recipe.image_url", 0] }],
+                        },
+                    },
+                },
+                {
                     $group: {
                         _id: "$meal_plan_id",
                         total_calories: { $sum: { $ifNull: ["$calories", 0] } },
                         item_count: { $sum: 1 },
-                        preview_image: { $max: "$image_url" },
+                        preview_image: { $max: "$any_image" },
                     },
                 },
             ]);
