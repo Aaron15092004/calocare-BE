@@ -3,6 +3,7 @@ import ChatSession, { IChatMessage } from "../../models/ChatSession";
 import FoodDiary from "../../models/FoodDiary";
 import Store from "../../models/Store";
 import User, { IUser } from "../../models/User";
+import { trackAiUsage } from "../../utils/aiUsage";
 import { getLLMService, LLMMessage } from "./LLMService";
 import { getFoodSearchService } from "./FoodSearchService";
 import { getIntentClassifier } from "./IntentClassifier";
@@ -218,6 +219,7 @@ export class ChatbotService {
             content: message,
             timestamp: new Date(),
         });
+        trackAiUsage("chat_msg");
 
         if (shouldUseTools) {
             await this._handleAction(session, messages, userId, onChunk, onEvent, userLocation);

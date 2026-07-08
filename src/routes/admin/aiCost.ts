@@ -14,8 +14,17 @@ const COST_PER_MEAL_PLAN_7D = 0.020;   // Groq: ~10 LLM calls per 7-day plan wit
 const COST_PER_SCAN = 0.0002;          // Gemini 2.0 Flash vision: ~1.1K tokens/call
 const COST_PER_EMBED = 0.000001;       // Voyage voyage-4-lite: per text embedded
 
+const USD_TO_VND = Number(process.env.AI_COST_USD_TO_VND || 26000);
+
 // Chat monthly soft limits per tier (-1 = unlimited, used for usage % display in FE)
 const CHAT_LIMIT = { free: 150, premium: 100, family: -1, pro: -1 };
+
+// Scan calls are tracked per provider; Gemini is primary, Groq Llama-4 vision is the fallback
+const SCAN_SERVICES = ["gemini", "groq_vision"];
+
+function hourKey(date: Date): string {
+    return date.toISOString().slice(0, 13);
+}
 
 // GET /api/admin/ai-cost
 router.get("/", authenticate, requireAdminOrModerator, async (_req: Request, res: Response) => {
@@ -26,14 +35,25 @@ router.get("/", authenticate, requireAdminOrModerator, async (_req: Request, res
         // Hour-bucket prefix for the current month, e.g. "2026-05"
         const monthPrefix = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}`;
 
-        const [userTierAgg, chatByUserAgg, mealPlanAgg, chatTrendAgg, geminiAgg, voyageAgg] = await Promise.all([
+        const [
+            userTierAgg,
+            chatByUserAgg,
+            mealPlanAgg,
+            chatTrendAgg,
+            scanAgg,
+            voyageAgg,
+            chatUsageMonthAgg,
+            chatUsageTrendAgg,
+            mealPlanUsageAgg,
+        ] = await Promise.all([
             // User counts by subscription tier
             User.aggregate([
                 { $group: { _id: { $ifNull: ["$subscription_tier", "free"] }, count: { $sum: 1 } } },
             ]),
 
-            // Chat messages sent this month, grouped by user (unwinding messages array)
-            // Note: auto-summarize (at 20 msgs) trims old messages, so current-month data is reliable
+            // Chat messages sent this month, grouped by user (unwinding messages array).
+            // Auto-summarize trims old messages, so this can undercount — the durable
+            // "chat_msg" ApiUsage counter below is the source of truth for totals.
             ChatSession.aggregate([
                 { $unwind: "$messages" },
                 {
@@ -67,7 +87,7 @@ router.get("/", authenticate, requireAdminOrModerator, async (_req: Request, res
                 { $group: { _id: null, count: { $sum: 1 }, total_days: { $sum: "$total_days" } } },
             ]),
 
-            // Chat message counts per month for trend chart (last 6 months)
+            // Chat message counts per month for trend chart (last 6 months, session-derived)
             ChatSession.aggregate([
                 { $unwind: "$messages" },
                 {
@@ -88,9 +108,9 @@ router.get("/", authenticate, requireAdminOrModerator, async (_req: Request, res
                 { $sort: { "_id.year": 1, "_id.month": 1 } },
             ]),
 
-            // Actual Gemini scan calls this month from ApiUsage hourly buckets
+            // Actual scan calls this month (Gemini primary + Groq vision fallback)
             ApiUsage.aggregate([
-                { $match: { service: "gemini", hour: { $regex: `^${monthPrefix}` } } },
+                { $match: { service: { $in: SCAN_SERVICES }, hour: { $regex: `^${monthPrefix}` } } },
                 { $group: { _id: null, total: { $sum: "$count" } } },
             ]),
 
@@ -99,11 +119,33 @@ router.get("/", authenticate, requireAdminOrModerator, async (_req: Request, res
                 { $match: { service: "voyage", hour: { $regex: `^${monthPrefix}` } } },
                 { $group: { _id: null, total: { $sum: "$count" } } },
             ]),
+
+            // Durable chat message counter this month (immune to auto-summarize trimming)
+            ApiUsage.aggregate([
+                { $match: { service: "chat_msg", hour: { $regex: `^${monthPrefix}` } } },
+                { $group: { _id: null, total: { $sum: "$count" } } },
+            ]),
+
+            // Durable chat counter per month for trend chart
+            ApiUsage.aggregate([
+                { $match: { service: "chat_msg", hour: { $gte: hourKey(sixMonthsAgo) } } },
+                {
+                    $group: {
+                        _id: { $substrBytes: ["$hour", 0, 7] },
+                        count: { $sum: "$count" },
+                    },
+                },
+            ]),
+
+            // Durable meal plan counters this month
+            ApiUsage.aggregate([
+                { $match: { service: { $in: ["meal_plan", "meal_plan_day"] }, hour: { $regex: `^${monthPrefix}` } } },
+                { $group: { _id: "$service", total: { $sum: "$count" } } },
+            ]),
         ]);
 
         // --- User tier counts ---
         const tierMap = new Map(userTierAgg.map((r: any) => [r._id, r.count]));
-        const freeCount = tierMap.get("free") || 0;
         const premiumCount = tierMap.get("premium") || 0;
         const familyCount = (tierMap.get("family") || 0) + (tierMap.get("pro") || 0);
 
@@ -113,19 +155,24 @@ router.get("/", authenticate, requireAdminOrModerator, async (_req: Request, res
             const tier = (r.user?.subscription_tier as keyof typeof chatByTier) || "free";
             if (tier in chatByTier) chatByTier[tier] += r.msg_count;
         });
-        const totalChatMessages = chatByTier.free + chatByTier.premium + chatByTier.family + chatByTier.pro;
+        const sessionChatTotal = chatByTier.free + chatByTier.premium + chatByTier.family + chatByTier.pro;
+        const trackedChatTotal: number = chatUsageMonthAgg[0]?.total ?? 0;
+        // Sessions undercount after trimming; the tracked counter only exists going
+        // forward — take whichever is larger.
+        const totalChatMessages = Math.max(sessionChatTotal, trackedChatTotal);
         const avgMsgsPremium = premiumCount > 0 ? Math.round(chatByTier.premium / premiumCount) : 0;
         // Users at risk: premium users who have used ≥ 80% of their 100-message limit this month
         const premiumAtRisk = chatByUserAgg.filter(
             (r: any) => r.user?.subscription_tier === "premium" && r.msg_count >= 80
         ).length;
 
-        // --- Meal plan stats ---
-        const mealPlanCount: number = mealPlanAgg[0]?.count ?? 0;
-        const mealPlanTotalDays: number = mealPlanAgg[0]?.total_days ?? 0;
+        // --- Meal plan stats (max of persisted plans vs durable counter) ---
+        const mealPlanUsageMap = new Map(mealPlanUsageAgg.map((r: any) => [r._id, r.total]));
+        const mealPlanCount: number = Math.max(mealPlanAgg[0]?.count ?? 0, mealPlanUsageMap.get("meal_plan") ?? 0);
+        const mealPlanTotalDays: number = Math.max(mealPlanAgg[0]?.total_days ?? 0, mealPlanUsageMap.get("meal_plan_day") ?? 0);
 
         // --- Actual API usage from DB ---
-        const totalScans: number = geminiAgg[0]?.total ?? 0;
+        const totalScans: number = scanAgg[0]?.total ?? 0;
         const totalEmbeds: number = voyageAgg[0]?.total ?? 0;
 
         // --- Cost calculations (USD) ---
@@ -151,8 +198,15 @@ router.get("/", authenticate, requireAdminOrModerator, async (_req: Request, res
         const trendMap = new Map(
             chatTrendAgg.map((r: any) => [`${r._id.year}-${r._id.month}`, r.count])
         );
+        const trackedTrendMap = new Map(
+            chatUsageTrendAgg.map((r: any) => {
+                const [year, month] = String(r._id).split("-");
+                return [`${Number(year)}-${Number(month)}`, r.count];
+            })
+        );
         const chatTrend6m = months.map((m) => {
-            const msgs = trendMap.get(`${m.year}-${m.month}`) || 0;
+            const key = `${m.year}-${m.month}`;
+            const msgs = Math.max(trendMap.get(key) || 0, trackedTrendMap.get(key) || 0);
             return {
                 name: m.label,
                 messages: msgs,
@@ -162,6 +216,8 @@ router.get("/", authenticate, requireAdminOrModerator, async (_req: Request, res
 
         res.json({
             period: { start: startOfMonth, end: now },
+            generated_at: now.toISOString(),
+            usd_to_vnd: USD_TO_VND,
             stats: {
                 total_chat_messages: totalChatMessages,
                 chat_messages_by_tier: chatByTier,
@@ -169,6 +225,7 @@ router.get("/", authenticate, requireAdminOrModerator, async (_req: Request, res
                 premium_users_count: premiumCount,
                 family_users_count: familyCount,
                 total_meal_plans: mealPlanCount,
+                total_meal_plan_days: mealPlanTotalDays,
                 total_scans: totalScans,
                 total_embeds: totalEmbeds,
                 cost_chat_usd: costChat,

@@ -17,6 +17,9 @@ const COST_PER_MEAL_PLAN_7D = 0.020;
 const COST_PER_SCAN = 0.0002;
 const COST_PER_EMBED = 0.000001;
 const USD_TO_VND = Number(process.env.AI_COST_USD_TO_VND || 26000);
+const TZ = "Asia/Ho_Chi_Minh";
+// Scans are tracked per provider: Gemini primary + Groq Llama-4 vision fallback
+const SCAN_SERVICES = ["gemini", "groq_vision"];
 
 function startOfDay(date: Date): Date {
     return new Date(date.getFullYear(), date.getMonth(), date.getDate());
@@ -88,6 +91,49 @@ function getWebhookBaseUrl(): string | null {
     return process.env.PUBLIC_API_URL || process.env.API_PUBLIC_URL || null;
 }
 
+// Bucketed revenue rows (by day / ISO week / month) for the financial breakdown
+function periodPipeline(rangeMatch: Record<string, unknown>, format: string) {
+    return [
+        { $match: rangeMatch },
+        {
+            $group: {
+                _id: { $dateToString: { format, date: "$created_at", timezone: TZ } },
+                revenue: {
+                    $sum: { $cond: [{ $eq: ["$status", "completed"] }, VND_AMOUNT_EXPR, 0] },
+                },
+                completed_count: {
+                    $sum: { $cond: [{ $eq: ["$status", "completed"] }, 1, 0] },
+                },
+                pending_amount: {
+                    $sum: { $cond: [{ $eq: ["$status", "pending"] }, VND_AMOUNT_EXPR, 0] },
+                },
+                pending_count: {
+                    $sum: { $cond: [{ $eq: ["$status", "pending"] }, 1, 0] },
+                },
+                refunded_amount: {
+                    $sum: { $cond: [{ $eq: ["$status", "refunded"] }, VND_AMOUNT_EXPR, 0] },
+                },
+                failed_count: {
+                    $sum: { $cond: [{ $eq: ["$status", "failed"] }, 1, 0] },
+                },
+            },
+        },
+        { $sort: { _id: 1 as const } },
+    ];
+}
+
+function mapPeriodRows(rows: any[]) {
+    return rows.map((row) => ({
+        period: row._id as string,
+        revenue: row.revenue || 0,
+        completed_count: row.completed_count || 0,
+        pending_amount: row.pending_amount || 0,
+        pending_count: row.pending_count || 0,
+        refunded_amount: row.refunded_amount || 0,
+        failed_count: row.failed_count || 0,
+    }));
+}
+
 // GET /api/admin/revenue
 router.get("/", authenticate, requireAdmin, async (req: Request, res: Response) => {
     try {
@@ -100,6 +146,8 @@ router.get("/", authenticate, requireAdmin, async (req: Request, res: Response) 
         const [
             statusRows,
             dailyRows,
+            weeklyRows,
+            monthlyRows,
             planRows,
             methodRows,
             targetRows,
@@ -110,6 +158,8 @@ router.get("/", authenticate, requireAdmin, async (req: Request, res: Response) 
             chatUsageRows,
             mealPlanUsageRows,
             apiUsageRows,
+            chatTrackedRows,
+            topCustomerRows,
         ] = await Promise.all([
             PaymentTransaction.aggregate([
                 { $match: rangeMatch },
@@ -126,11 +176,7 @@ router.get("/", authenticate, requireAdmin, async (req: Request, res: Response) 
                 {
                     $group: {
                         _id: {
-                            $dateToString: {
-                                format: "%Y-%m-%d",
-                                date: "$created_at",
-                                timezone: "Asia/Ho_Chi_Minh",
-                            },
+                            $dateToString: { format: "%Y-%m-%d", date: "$created_at", timezone: TZ },
                         },
                         revenue: { $sum: VND_AMOUNT_EXPR },
                         count: { $sum: 1 },
@@ -138,6 +184,8 @@ router.get("/", authenticate, requireAdmin, async (req: Request, res: Response) 
                 },
                 { $sort: { _id: 1 } },
             ]),
+            PaymentTransaction.aggregate(periodPipeline(rangeMatch, "%G-W%V")),
+            PaymentTransaction.aggregate(periodPipeline(rangeMatch, "%Y-%m")),
             PaymentTransaction.aggregate([
                 { $match: { ...rangeMatch, status: "completed" } },
                 {
@@ -231,11 +279,50 @@ router.get("/", authenticate, requireAdmin, async (req: Request, res: Response) 
             ApiUsage.aggregate([
                 {
                     $match: {
-                        service: { $in: ["gemini", "voyage"] },
+                        service: { $in: [...SCAN_SERVICES, "voyage", "meal_plan", "meal_plan_day"] },
                         hour: { $gte: formatHourKey(start), $lte: formatHourKey(end) },
                     },
                 },
                 { $group: { _id: "$service", count: { $sum: "$count" } } },
+            ]),
+            // Durable chat counter (session messages get trimmed by auto-summarize)
+            ApiUsage.aggregate([
+                {
+                    $match: {
+                        service: "chat_msg",
+                        hour: { $gte: formatHourKey(start), $lte: formatHourKey(end) },
+                    },
+                },
+                { $group: { _id: null, count: { $sum: "$count" } } },
+            ]),
+            // Lifetime top customers (completed only) — for customer care
+            PaymentTransaction.aggregate([
+                { $match: { status: "completed" } },
+                {
+                    $group: {
+                        _id: "$user_id",
+                        total_spent: { $sum: VND_AMOUNT_EXPR },
+                        tx_count: { $sum: 1 },
+                        first_payment_at: { $min: "$created_at" },
+                        last_payment_at: { $max: "$created_at" },
+                        plans: { $addToSet: "$plan_type" },
+                        methods: { $addToSet: { $ifNull: ["$payment_method", "unknown"] } },
+                    },
+                },
+                { $sort: { total_spent: -1 } },
+                { $limit: 20 },
+                {
+                    $lookup: {
+                        from: "users",
+                        localField: "_id",
+                        foreignField: "_id",
+                        as: "user",
+                        pipeline: [
+                            { $project: { display_name: 1, email: 1, subscription_tier: 1, subscription_expires_at: 1 } },
+                        ],
+                    },
+                },
+                { $unwind: { path: "$user", preserveNullAndEmptyArrays: true } },
             ]),
         ]);
 
@@ -252,10 +339,10 @@ router.get("/", authenticate, requireAdmin, async (req: Request, res: Response) 
 
         const webhookBaseUrl = getWebhookBaseUrl();
         const apiUsageMap = new Map(apiUsageRows.map((row: any) => [row._id, row.count]));
-        const chatMessages = chatUsageRows[0]?.count || 0;
-        const mealPlanCount = mealPlanUsageRows[0]?.count || 0;
-        const mealPlanTotalDays = mealPlanUsageRows[0]?.total_days || 0;
-        const scanCalls = apiUsageMap.get("gemini") || 0;
+        const chatMessages = Math.max(chatUsageRows[0]?.count || 0, chatTrackedRows[0]?.count || 0);
+        const mealPlanCount = Math.max(mealPlanUsageRows[0]?.count || 0, apiUsageMap.get("meal_plan") || 0);
+        const mealPlanTotalDays = Math.max(mealPlanUsageRows[0]?.total_days || 0, apiUsageMap.get("meal_plan_day") || 0);
+        const scanCalls = SCAN_SERVICES.reduce((sum, service) => sum + (apiUsageMap.get(service) || 0), 0);
         const embedCalls = apiUsageMap.get("voyage") || 0;
         const costChatUsd = +(chatMessages * COST_PER_CHAT_MSG).toFixed(4);
         const costMealPlansUsd = +((mealPlanTotalDays / 7) * COST_PER_MEAL_PLAN_7D).toFixed(4);
@@ -274,6 +361,7 @@ router.get("/", authenticate, requireAdmin, async (req: Request, res: Response) 
                 end_date: end.toISOString(),
                 days,
             },
+            generated_at: new Date().toISOString(),
             totals: {
                 completed_revenue: completedRevenue,
                 estimated_ai_cost_vnd: totalAiCostVnd,
@@ -295,6 +383,8 @@ router.get("/", authenticate, requireAdmin, async (req: Request, res: Response) 
             },
             charts: {
                 daily_revenue: buildDailySeries(start, end, dailyRows),
+                weekly_revenue: mapPeriodRows(weeklyRows),
+                monthly_revenue: mapPeriodRows(monthlyRows),
                 by_plan: planRows.map((row) => ({
                     plan_type: row._id || "unknown",
                     revenue: row.revenue || 0,
@@ -341,6 +431,19 @@ router.get("/", authenticate, requireAdmin, async (req: Request, res: Response) 
                 payos_webhook_path: "/api/subscription/webhook/payos",
                 payos_webhook_url: webhookBaseUrl ? `${webhookBaseUrl}/api/subscription/webhook/payos` : null,
             },
+            top_customers: topCustomerRows.map((row: any) => ({
+                user_id: row._id,
+                display_name: row.user?.display_name || "—",
+                email: row.user?.email || "—",
+                subscription_tier: row.user?.subscription_tier || "free",
+                subscription_expires_at: row.user?.subscription_expires_at || null,
+                total_spent: row.total_spent || 0,
+                tx_count: row.tx_count || 0,
+                first_payment_at: row.first_payment_at,
+                last_payment_at: row.last_payment_at,
+                plans: row.plans || [],
+                methods: row.methods || [],
+            })),
             recent_transactions: recentTransactions.map((tx: any) => ({
                 _id: tx._id,
                 user: tx.user_id ? {
@@ -359,6 +462,126 @@ router.get("/", authenticate, requireAdmin, async (req: Request, res: Response) 
                 payment_method: tx.payment_method,
                 payment_ref: tx.payment_ref,
                 duration_months: tx.duration_months,
+                notes: tx.notes,
+                created_at: tx.created_at,
+                updated_at: tx.updated_at,
+            })),
+        });
+    } catch (error) {
+        res.status(500).json({ error: (error as Error).message });
+    }
+});
+
+// GET /api/admin/revenue/transactions — paginated transaction history with filters
+// Query: page, limit, status, method, plan, search (name/email/payment_ref/discount code)
+router.get("/transactions", authenticate, requireAdmin, async (req: Request, res: Response) => {
+    try {
+        const page = Math.max(1, Number(req.query.page) || 1);
+        const limit = Math.min(100, Math.max(1, Number(req.query.limit) || 20));
+        const status = typeof req.query.status === "string" ? req.query.status.trim() : "";
+        const method = typeof req.query.method === "string" ? req.query.method.trim() : "";
+        const plan = typeof req.query.plan === "string" ? req.query.plan.trim() : "";
+        const search = typeof req.query.search === "string" ? req.query.search.trim() : "";
+
+        const match: Record<string, unknown> = {};
+        if (status && ["pending", "completed", "failed", "refunded"].includes(status)) match.status = status;
+        if (method) match.payment_method = method === "unknown" ? { $in: [null, ""] } : method;
+        if (plan) match.plan_type = plan;
+
+        const pipeline: any[] = [
+            { $match: match },
+            { $sort: { created_at: -1 } },
+            {
+                $lookup: {
+                    from: "users",
+                    localField: "user_id",
+                    foreignField: "_id",
+                    as: "user",
+                    pipeline: [{ $project: { display_name: 1, email: 1, subscription_tier: 1 } }],
+                },
+            },
+            { $unwind: { path: "$user", preserveNullAndEmptyArrays: true } },
+            {
+                $lookup: {
+                    from: "stores",
+                    localField: "store_id",
+                    foreignField: "_id",
+                    as: "store",
+                    pipeline: [{ $project: { name: 1 } }],
+                },
+            },
+            { $unwind: { path: "$store", preserveNullAndEmptyArrays: true } },
+        ];
+
+        if (search) {
+            const regex = new RegExp(search.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i");
+            pipeline.push({
+                $match: {
+                    $or: [
+                        { "user.display_name": regex },
+                        { "user.email": regex },
+                        { "store.name": regex },
+                        { payment_ref: regex },
+                        { discount_code: regex },
+                    ],
+                },
+            });
+        }
+
+        pipeline.push({
+            $facet: {
+                rows: [
+                    { $skip: (page - 1) * limit },
+                    { $limit: limit },
+                    {
+                        $project: {
+                            plan_type: 1,
+                            target_type: 1,
+                            status: 1,
+                            amount: 1,
+                            final_amount: 1,
+                            discount_code: 1,
+                            payment_method: 1,
+                            payment_ref: 1,
+                            duration_months: 1,
+                            notes: 1,
+                            created_at: 1,
+                            updated_at: 1,
+                            user: 1,
+                            store: 1,
+                        },
+                    },
+                ],
+                total: [{ $count: "count" }],
+            },
+        });
+
+        const [result] = await PaymentTransaction.aggregate(pipeline);
+        const total = result?.total?.[0]?.count || 0;
+
+        res.json({
+            page,
+            limit,
+            total,
+            total_pages: Math.max(1, Math.ceil(total / limit)),
+            transactions: (result?.rows || []).map((tx: any) => ({
+                _id: tx._id,
+                user: tx.user ? {
+                    display_name: tx.user.display_name,
+                    email: tx.user.email,
+                    subscription_tier: tx.user.subscription_tier,
+                } : null,
+                store: tx.store ? { name: tx.store.name } : null,
+                plan_type: tx.plan_type,
+                target_type: tx.target_type,
+                status: tx.status,
+                amount: tx.amount,
+                final_amount: tx.final_amount,
+                discount_code: tx.discount_code,
+                payment_method: tx.payment_method,
+                payment_ref: tx.payment_ref,
+                duration_months: tx.duration_months,
+                notes: tx.notes,
                 created_at: tx.created_at,
                 updated_at: tx.updated_at,
             })),
