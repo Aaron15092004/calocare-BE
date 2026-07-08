@@ -1,49 +1,14 @@
 import { Router, Request, Response } from "express";
-import mongoose from "mongoose";
 import { authenticate } from "../middleware/auth";
 import { requireAdmin } from "../middleware/roleCheck";
-import { monthKey, secondsUntilEndOfMonthUTC } from "../middleware/ragRateLimit";
 import MealPlan from "../models/MealPlan";
 import MealPlanItem from "../models/MealPlanItem";
 import UserMealPlan from "../models/UserMealPlan";
-import Recipe from "../models/Recipe";
-import User, { IUser } from "../models/User";
+import { IUser } from "../models/User";
 
-const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-flash-latest";
-const GEMINI_BASE  = "https://generativelanguage.googleapis.com/v1beta/models";
-const REWARD_COUNTER_COLLECTION = "rate_limit_counters";
-const MEAL_PLAN_VIDEOS_REQUIRED = 5;
-
-function cleanJson(raw: string): string {
-    let s = raw.trim();
-    if (s.startsWith("```json")) s = s.slice(7);
-    if (s.startsWith("```"))     s = s.slice(3);
-    if (s.endsWith("```"))       s = s.slice(0, -3);
-    return s.trim();
-}
-
-async function callGemini(apiKey: string, body: object): Promise<string> {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 90_000);
-    try {
-        const res = await fetch(
-            `${GEMINI_BASE}/${GEMINI_MODEL}:generateContent`,
-            {
-                method: "POST",
-                headers: { "Content-Type": "application/json", "X-goog-api-key": apiKey },
-                body: JSON.stringify(body),
-                signal: controller.signal,
-            },
-        );
-        if (!res.ok) throw new Error(`Gemini error: ${res.status}`);
-        const data = (await res.json()) as {
-            candidates?: { content?: { parts?: { text?: string }[] } }[];
-        };
-        return data.candidates?.[0]?.content?.parts?.[0]?.text ?? "";
-    } finally {
-        clearTimeout(timer);
-    }
-}
+// NOTE: the old blocking POST /generate (direct Gemini call, separate quota) was
+// removed — the SSE endpoint POST /api/rag/generate-meal-plan is the single
+// generation path used by both clients.
 
 const router = Router();
 
@@ -51,7 +16,7 @@ const router = Router();
 router.get("/", authenticate, async (req: Request, res: Response) => {
     try {
         const user = req.user as IUser;
-        const { mine, community, pending, goal_type, limit = 50, offset = 0 } = req.query;
+        const { mine, community, pending, goal_type, q, limit = 50, offset = 0 } = req.query;
         const filter: Record<string, unknown> = {};
 
         if (mine === "true") {
@@ -79,13 +44,19 @@ router.get("/", authenticate, async (req: Request, res: Response) => {
         }
 
         if (goal_type) filter.goal_type = goal_type;
+        // Server-side text search so community browsing doesn't rely on a
+        // client-side filter over a capped page
+        if (typeof q === "string" && q.trim()) {
+            const regex = new RegExp(q.trim().replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i");
+            filter.$and = [{ $or: [{ title: regex }, { description: regex }, { tags: regex }] }];
+        }
         // Hide in-flight/failed generations (legacy docs have no status field and pass)
         filter.status = { $nin: ["generating", "failed"] };
 
         const plans = await MealPlan.find(filter)
             .sort({ created_at: -1 })
-            .limit(Number(limit))
-            .skip(Number(offset));
+            .limit(Math.min(Number(limit) || 50, 100))
+            .skip(Number(offset) || 0);
 
         const total = await MealPlan.countDocuments(filter);
         res.json({ data: plans, total });
@@ -131,6 +102,34 @@ router.get("/mine/recovery", authenticate, async (req: Request, res: Response) =
                 created_at: plan.created_at,
             },
         });
+    } catch (error) {
+        res.status(500).json({ error: (error as Error).message });
+    }
+});
+
+// GET /api/meal-plans/templates — predefined template plans (MP-08)
+// Registered BEFORE /:id — it used to be shadowed by the param route and 500'd.
+router.get("/templates", authenticate, async (_req: Request, res: Response) => {
+    try {
+        const templates = await MealPlan.find({
+            is_public: true,
+            is_approved: true,
+            tags: { $in: ["template"] },
+        })
+            .select("title description total_days goal_type tags")
+            .sort({ title: 1 })
+            .limit(20)
+            .lean();
+
+        // Group by goal_type
+        const grouped: Record<string, typeof templates> = {};
+        for (const t of templates) {
+            const key = t.goal_type ?? "other";
+            if (!grouped[key]) grouped[key] = [];
+            grouped[key].push(t);
+        }
+
+        res.json({ templates, grouped });
     } catch (error) {
         res.status(500).json({ error: (error as Error).message });
     }
@@ -335,6 +334,45 @@ router.post("/:id/reject", authenticate, requireAdmin, async (req: Request, res:
     }
 });
 
+// POST /api/meal-plans/:id/activate — unified activation used by all client
+// entry points (own AI/manual plans AND community plans). Deactivates the
+// previous active plan and links this one. Supersedes POST /user-meal-plans
+// and /:id/clone, which stay for older mobile builds.
+router.post("/:id/activate", authenticate, async (req: Request, res: Response) => {
+    try {
+        const user = req.user as IUser;
+        const plan = await MealPlan.findById(req.params.id);
+        if (!plan) {
+            res.status(404).json({ error: "Meal plan not found" });
+            return;
+        }
+        if (!(await canViewPlan(user, plan))) {
+            res.status(403).json({ error: "Forbidden" });
+            return;
+        }
+        if ((plan.status ?? "completed") === "generating") {
+            res.status(409).json({ error: "plan_generating", message: "Thực đơn đang được tạo, vui lòng chờ hoàn tất." });
+            return;
+        }
+
+        await UserMealPlan.updateMany({ user_id: user._id, is_active: true }, { is_active: false });
+        const userPlan = await UserMealPlan.create({
+            user_id: user._id,
+            meal_plan_id: plan._id,
+            start_date: new Date(),
+            is_active: true,
+        });
+
+        res.status(201).json({
+            user_meal_plan_id: userPlan._id,
+            meal_plan_id: plan._id,
+            start_date: userPlan.start_date,
+        });
+    } catch (error) {
+        res.status(500).json({ error: (error as Error).message });
+    }
+});
+
 // POST /api/meal-plans/:id/clone — user clones an approved community plan as their active plan
 router.post("/:id/clone", authenticate, async (req: Request, res: Response) => {
     try {
@@ -404,34 +442,6 @@ router.post("/:id/duplicate", authenticate, async (req: Request, res: Response) 
     }
 });
 
-// GET /api/meal-plans/templates — predefined template plans (MP-08)
-// Returns approved public plans tagged as templates, grouped by goal
-router.get("/templates", authenticate, async (_req: Request, res: Response) => {
-    try {
-        const templates = await MealPlan.find({
-            is_public: true,
-            is_approved: true,
-            tags: { $in: ["template"] },
-        })
-            .select("title description total_days goal_type tags")
-            .sort({ title: 1 })
-            .limit(20)
-            .lean();
-
-        // Group by goal_type
-        const grouped: Record<string, typeof templates> = {};
-        for (const t of templates) {
-            const key = t.goal_type ?? "other";
-            if (!grouped[key]) grouped[key] = [];
-            grouped[key].push(t);
-        }
-
-        res.json({ templates, grouped });
-    } catch (error) {
-        res.status(500).json({ error: (error as Error).message });
-    }
-});
-
 // GET /api/meal-plans/:id/shopping-list — generate ingredients list from meal plan items (MP-09)
 router.get("/:id/shopping-list", authenticate, async (req: Request, res: Response) => {
     try {
@@ -495,268 +505,5 @@ router.get("/:id/shopping-list", authenticate, async (req: Request, res: Respons
     }
 });
 
-// POST /api/meal-plans/generate — CaloVie AI personalized meal plan (Premium = 7d, Pro = 21d)
-router.post("/generate", authenticate, async (req: Request, res: Response) => {
-    let consumedFreeReward: { userId: string; month: string } | null = null;
-    try {
-        const user = req.user as IUser;
-        const tier: string = (user as any).subscription_tier ?? "free";
-
-        const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
-        if (!GEMINI_API_KEY) {
-            res.status(500).json({ error: "AI chưa được cấu hình." });
-            return;
-        }
-
-        const normalizedTier = tier === "pro" ? "family" : tier;
-        const totalDays = normalizedTier === "family" ? 21 : 7;
-
-        const fullUser = await User.findById(user._id);
-        const prefs    = (fullUser?.preferences as Record<string, unknown>) ?? {};
-        const goals    = (fullUser?.daily_nutrition_goals ?? {}) as Record<string, unknown>;
-
-        const age      = (prefs.age as number) || 25;
-        const gender   = (prefs.gender as string) === "female" ? "Nữ" : "Nam";
-        const weight   = (prefs.weight_kg as number) || 60;
-        const height   = (prefs.height_cm as number) || 165;
-        const activityMap: Record<string, string> = {
-            sedentary:  "Ít vận động",
-            light:      "Nhẹ (1–2 ngày/tuần)",
-            moderate:   "Vừa (3–5 ngày/tuần)",
-            active:     "Nhiều (6–7 ngày/tuần)",
-            veryActive: "Rất nhiều (cường độ cao hàng ngày)",
-        };
-        const activity = activityMap[(prefs.activity_level as string) ?? ""] ?? "Vừa phải";
-        const targetCal = (goals.calories as number) || 2000;
-
-        const {
-            diet_type = "omnivore",
-            foods_to_avoid = "",
-            cuisine = "mixed",
-            goal_type = "health",
-            cheat_day = false,
-            specific_foods = "",
-            custom_calories,
-        } = req.body;
-
-        // Allow user to override their profile calorie goal
-        const effectiveCalories = custom_calories ? Number(custom_calories) : targetCal;
-
-        const dietLabel: Record<string, string> = {
-            omnivore:   "Ăn đa dạng (cả thịt và rau)",
-            vegetarian: "Ăn chay có trứng/sữa",
-            vegan:      "Ăn thuần chay",
-        };
-        const cuisineLabel: Record<string, string> = {
-            vietnamese:    "Ưu tiên món Việt",
-            international: "Ưu tiên món quốc tế",
-            mixed:         "Kết hợp Việt và quốc tế",
-        };
-        const goalLabel: Record<string, string> = {
-            weight_loss: "Giảm cân",
-            muscle_gain: "Tăng cơ / Tăng cân",
-            maintain:    "Duy trì cân nặng",
-            health:      "Ăn uống lành mạnh",
-        };
-
-        const cheatDayNote = cheat_day
-            ? `\nCheat day: Cho phép 1 ngày ăn tự do (thứ Bảy hoặc Chủ Nhật) — ngày đó không giới hạn món, nhưng vẫn ghi nhận calories. Đánh dấu ngày đó bằng description "🎉 Cheat day".`
-            : "";
-        const specificFoodsNote = specific_foods
-            ? `\nYêu cầu thực phẩm cụ thể: ${specific_foods} — phải xuất hiện ít nhất 1 lần trong thực đơn.`
-            : "";
-
-        const prompt = `Bạn là CaloVie AI – chuyên gia dinh dưỡng thông minh. Hãy tạo thực đơn cá nhân hóa ${totalDays} ngày CHI TIẾT cho người dùng sau:
-
-Hồ sơ: Tuổi ${age}, ${gender}, ${weight}kg, cao ${height}cm, hoạt động: ${activity}
-Mục tiêu: ${goalLabel[goal_type] || "Ăn uống lành mạnh"} · ${effectiveCalories} kcal/ngày
-Chế độ ăn: ${dietLabel[diet_type] || dietLabel["omnivore"]}
-Ẩm thực: ${cuisineLabel[cuisine] || cuisineLabel["mixed"]}
-${foods_to_avoid ? `Tránh: ${foods_to_avoid}` : ""}${cheatDayNote}${specificFoodsNote}
-
-QUY TẮC BẮT BUỘC:
-1. Mỗi ngày: breakfast + lunch + dinner + snack (4 bữa)
-2. Tổng calo/ngày ≈ ${effectiveCalories} kcal (±150 chấp nhận được)
-3. Macro: Protein 25-35%, Carbs 40-50%, Fat 20-30%
-4. Không lặp cùng món quá 2 lần trong ${totalDays} ngày
-5. Nguyên liệu dễ mua ở Việt Nam
-6. Mỗi món PHẢI có: danh sách nguyên liệu (3-7 nguyên liệu) VÀ hướng dẫn nấu (3-5 bước)
-
-Trả lời CHỈ bằng JSON hợp lệ:
-{
-  "title": "Tên thực đơn ngắn gọn",
-  "description": "Mô tả 1-2 câu về thực đơn và lợi ích",
-  "goal_type": "${goal_type}",
-  "days": [
-    {
-      "day_number": 1,
-      "meals": [
-        {
-          "meal_type": "breakfast",
-          "name": "Tên món ăn",
-          "description": "Mô tả ngắn 1 câu",
-          "calories_kcal": 380,
-          "protein_g": 18,
-          "carbs_g": 48,
-          "fat_g": 10,
-          "fiber_g": 4,
-          "serving_description": "1 tô (350g)",
-          "ingredients": [
-            { "name": "Tên nguyên liệu", "amount": "80g", "kcal": 280 }
-          ],
-          "steps": [
-            "Bước 1: mô tả cụ thể.",
-            "Bước 2: mô tả cụ thể."
-          ]
-        }
-      ]
-    }
-  ]
-}`;
-
-        const raw = await callGemini(GEMINI_API_KEY, {
-            contents: [{ role: "user", parts: [{ text: prompt }] }],
-            generationConfig: { temperature: 0.35, maxOutputTokens: 16384 },
-        });
-
-        type AIMeal = {
-            meal_type: string;
-            name: string;
-            description?: string;
-            calories_kcal: number;
-            protein_g: number;
-            carbs_g: number;
-            fat_g: number;
-            fiber_g?: number;
-            serving_description?: string;
-            ingredients?: { name: string; amount: string; kcal: number }[];
-            steps?: string[];
-        };
-        type AIDay = { day_number: number; meals: AIMeal[] };
-        let parsed: { title: string; description: string; goal_type: string; days: AIDay[] };
-
-        try {
-            parsed = JSON.parse(cleanJson(raw));
-        } catch {
-            res.status(500).json({ error: "AI trả về định dạng không hợp lệ, vui lòng thử lại." });
-            return;
-        }
-
-        if (!parsed.days || !Array.isArray(parsed.days) || parsed.days.length === 0) {
-            res.status(500).json({ error: "AI không tạo được thực đơn hợp lệ, vui lòng thử lại." });
-            return;
-        }
-
-        if (tier === "free") {
-            const userId = (user._id as { toString(): string }).toString();
-            const month = monthKey();
-            const unlockKey = `${userId}:meal_plan_unlock:${month}`;
-            const db = mongoose.connection.db;
-            if (!db) {
-                res.status(503).json({ error: "Hệ thống phần thưởng đang tạm thời không khả dụng." });
-                return;
-            }
-
-            // Atomically spend the monthly reward only after the AI returned valid content.
-            // This prevents concurrent requests from creating more than one free plan.
-            const consumed = await db.collection(REWARD_COUNTER_COLLECTION).findOneAndDelete({ key: unlockKey });
-            if (!consumed) {
-                res.status(403).json({
-                    error: "Hãy nâng cấp Premium hoặc hoàn tất 5 video thưởng để mở khóa 1 thực đơn tháng này.",
-                    code: "meal_plan_reward_required",
-                });
-                return;
-            }
-            consumedFreeReward = { userId, month };
-        }
-
-        // Create MealPlan header
-        const plan = await MealPlan.create({
-            title:       parsed.title || `Thực đơn ${totalDays} ngày cá nhân hóa`,
-            description: parsed.description || "",
-            total_days:  totalDays,
-            goal_type:   parsed.goal_type || goal_type,
-            tags:        ["AI", "CaloVie AI", normalizedTier === "family" ? "21 ngày" : "7 ngày"],
-            creator_id:  user._id,
-            is_public:   false,
-            is_approved: false,
-        });
-
-        // Batch-create Recipe records for all AI-generated meals
-        type RecipeEntry = { day: number; meal_type: string; sort_order: number };
-        const recipeEntries: RecipeEntry[] = [];
-        const recipeInputs: object[] = [];
-        let sortOrder = 0;
-
-        for (const day of parsed.days) {
-            if (!Array.isArray(day.meals)) continue;
-            for (const meal of day.meals) {
-                recipeEntries.push({ day: day.day_number, meal_type: meal.meal_type, sort_order: sortOrder++ });
-                recipeInputs.push({
-                    name_vi:           meal.name,
-                    description:       meal.description || "",
-                    calories:          Number(meal.calories_kcal) || 0,
-                    protein:           Number(meal.protein_g) || 0,
-                    carbs:             Number(meal.carbs_g) || 0,
-                    fat:               Number(meal.fat_g) || 0,
-                    fiber:             Number(meal.fiber_g) || 0,
-                    servings:          1,
-                    meal_type:         meal.meal_type as "breakfast" | "lunch" | "dinner" | "snack",
-                    cuisine_type:      cuisine,
-                    tags:              ["AI", "cá nhân hóa"],
-                    is_public:         false,
-                    is_approved:       false,
-                    ai_training_approved: false,
-                    images:            [],
-                    instructions: [
-                        { type: "ingredients", items: meal.ingredients ?? [] },
-                        { type: "steps",       items: meal.steps ?? [] },
-                    ],
-                });
-            }
-        }
-
-        const savedRecipes = await Recipe.insertMany(recipeInputs);
-
-        const itemDocs = recipeEntries.map((entry, i) => ({
-            meal_plan_id: plan._id,
-            day_number:   entry.day,
-            meal_type:    entry.meal_type,
-            recipe_id:    savedRecipes[i]._id,
-            sort_order:   entry.sort_order,
-        }));
-        await MealPlanItem.insertMany(itemDocs);
-
-        if (consumedFreeReward) {
-            const videosKey = `${consumedFreeReward.userId}:meal_plan_videos:${consumedFreeReward.month}`;
-            await mongoose.connection.db?.collection(REWARD_COUNTER_COLLECTION).deleteOne({ key: videosKey });
-        }
-
-        res.status(201).json({
-            plan_id:     (plan._id as any).toString(),
-            title:       plan.title,
-            description: plan.description,
-            total_days:  plan.total_days,
-            goal_type:   plan.goal_type,
-            days:        parsed.days,
-        });
-    } catch (error) {
-        if (consumedFreeReward) {
-            const expiresAt = new Date(Date.now() + secondsUntilEndOfMonthUTC() * 1000);
-            const unlockKey = `${consumedFreeReward.userId}:meal_plan_unlock:${consumedFreeReward.month}`;
-            await mongoose.connection.db?.collection(REWARD_COUNTER_COLLECTION).updateOne(
-                { key: unlockKey },
-                { $set: { count: 1, expires_at: expiresAt }, $setOnInsert: { key: unlockKey } },
-                { upsert: true },
-            ).catch(() => undefined);
-        }
-        const err = error as any;
-        if (err.name === "AbortError") {
-            res.status(504).json({ error: "AI mất quá nhiều thời gian, vui lòng thử lại." });
-        } else {
-            res.status(500).json({ error: err.message || "Lỗi tạo thực đơn." });
-        }
-    }
-});
 
 export default router;

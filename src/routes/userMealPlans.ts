@@ -4,6 +4,7 @@ import { IUser } from "../models/User";
 import UserMealPlan from "../models/UserMealPlan";
 import UserMealPlanItem from "../models/UserMealPlanItem";
 import MealPlanItem from "../models/MealPlanItem";
+import MealProgress from "../models/MealProgress";
 
 const ITEM_POPULATE = [
     { path: "recipe_id", select: "name_vi name_en calories protein carbs fat fiber description instructions image_url" },
@@ -119,11 +120,18 @@ router.post("/", authenticate, async (req: Request, res: Response) => {
     }
 });
 
-// DELETE /api/user-meal-plans/:id
+// DELETE /api/user-meal-plans/:id — cascades to plan-scoped items/progress.
+// FoodDiary entries created from completed meals are intentionally preserved.
 router.delete("/:id", authenticate, async (req: Request, res: Response) => {
     try {
         const user = req.user as IUser;
-        await UserMealPlan.findOneAndDelete({ _id: req.params.id, user_id: user._id });
+        const plan = await UserMealPlan.findOneAndDelete({ _id: req.params.id, user_id: user._id });
+        if (plan) {
+            await Promise.all([
+                UserMealPlanItem.deleteMany({ user_meal_plan_id: plan._id }),
+                MealProgress.deleteMany({ user_meal_plan_id: plan._id }),
+            ]);
+        }
         res.json({ message: "Plan removed" });
     } catch (error) {
         res.status(500).json({ error: (error as Error).message });
