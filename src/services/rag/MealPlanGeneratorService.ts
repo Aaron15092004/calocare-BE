@@ -276,10 +276,16 @@ export class MealPlanGeneratorService {
         const effectiveDiet = effectiveReq.preferences?.dietary_preference;
         const effectiveAllergies = effectiveReq.preferences?.allergies;
 
-        // Auto-TDEE via Mifflin-St Jeor if profile is complete; fall back to stored goal
+        // The user's stored daily calorie goal is authoritative — onboarding
+        // already computed TEE (Schofield) WITH the goal offset baked in, and
+        // the user may have hand-tuned it. Only when no goal exists do we fall
+        // back to Mifflin-St Jeor TDEE + per-goal offset. (Previously TDEE
+        // silently overrode the stored goal: goal 3000 → plan ~2000.)
+        const storedGoalCalories = user?.daily_nutrition_goals?.calories;
         const tdee = this._calculateTDEE({ weight_kg: w, height_cm: h, age, gender, activity_level: activity });
-        const baseCalories = tdee ?? user?.daily_nutrition_goals?.calories ?? 2000;
-        const dailyCalories = baseCalories + CALORIE_OFFSET[req.goal];
+        const dailyCalories = storedGoalCalories && storedGoalCalories >= 1000
+            ? storedGoalCalories
+            : (tdee ?? 2000) + CALORIE_OFFSET[req.goal];
         const [pPct, cPct, fPct] = MACRO_SPLITS[req.goal];
 
         const dailyTargets = {
@@ -305,7 +311,7 @@ export class MealPlanGeneratorService {
         if (h) bioLines.push(`${h}cm`);
         if (bmi) bioLines.push(`BMI ${bmi}(${bmiCat})`);
         if (activity) bioLines.push(activityLabels[activity] ?? activity);
-        if (tdee) bioLines.push(`TDEE ~${tdee}kcal/ngày`);
+        bioLines.push(`mục tiêu ${dailyCalories}kcal/ngày`);
         if (effectiveDiet && effectiveDiet !== "omnivore") bioLines.push(`chế độ ăn: ${effectiveDiet}`);
         if (effectiveAllergies?.length) bioLines.push(`tránh: ${effectiveAllergies.join(", ")}`);
         const userBio = bioLines.length ? bioLines.join(" · ") : undefined;
